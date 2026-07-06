@@ -14,22 +14,32 @@ Module-level tests only, covering:
     gui.py:1228-1230) bypasses the TTY guard entirely, since the guard lives
     inside the original implementation only (Req 8.4, 15.6).
 
-Task 13 (Phase C, export.py CLI flags) appends CLI-level tests to this file
-later -- these tests exercise modules.apps / modules.checklist directly, not
-export.py's argument parsing.
+Task 13 (Phase C, export.py CLI flags) appends CLI-level tests below this
+point, covering export.py's argument parsing and orchestration directly:
+  - `export.main()` with `--all-apps` / `--apps-from` never invokes
+    `modules.checklist.run` (Req 8.1, 8.2, 8.5).
+  - `--all-apps` and `--apps-from` are mutually exclusive (argparse error).
+  - `--name` collision fails fast (before any module runs) naming the
+    colliding path, and `--force` overwrites it (Req 13.3).
+  - `snapshot.json` carries `"0.3.0"` (Req 14.1).
+  - `export._build_modules(...)` names equal `modules.manifest.MODULE_NAMES`
+    in order (Req 2.5).
 
-**Validates: Requirements 8.1, 8.2, 8.3, 8.4, 8.5, 15.1, 15.6**
+**Validates: Requirements 8.1, 8.2, 8.3, 8.4, 8.5, 13.3, 14.1, 15.1, 15.6**
 """
 
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 
-from modules import apps, checklist
+from modules import apps, checklist, manifest
+
+import export
 
 
 # ---------------------------------------------------------------------------
@@ -212,3 +222,180 @@ def test_gui_style_monkeypatch_bypasses_tty_guard(monkeypatch, snapshot_dir):
         {"PackageIdentifier": "Git.Git"},
         {"PackageIdentifier": "Discord.Discord"},
     ]
+
+
+# ---------------------------------------------------------------------------
+# CLI-level tests (Task 13): export.py's argument parsing and orchestration.
+# These drive export.main() via monkeypatched sys.argv, with --only apps so
+# only modules.apps.export runs for real (the other 12 manifest modules are
+# imported by _build_modules but never invoked, so no other module touches
+# the live registry/filesystem during these tests).
+# ---------------------------------------------------------------------------
+
+def _read_snapshot_json_from_zip(zip_path: Path, folder_name: str) -> dict:
+    with zipfile.ZipFile(zip_path) as zf:
+        return json.loads(zf.read(f"{folder_name}/snapshot.json"))
+
+
+def test_cli_all_apps_never_invokes_checklist_run(monkeypatch, tmp_path):
+    _stub_discovery(monkeypatch)
+    checklist_calls = []
+    monkeypatch.setattr(checklist, "run", lambda *a, **kw: checklist_calls.append((a, kw)))
+
+    monkeypatch.setattr(sys, "argv", [
+        "export.py", "--all-apps",
+        "--output", str(tmp_path),
+        "--only", "apps",
+        "--name", "cli_all_apps",
+    ])
+
+    export.main()
+
+    assert checklist_calls == []
+    zip_path = tmp_path / "cli_all_apps.winsnap"
+    assert zip_path.exists()
+    data = _read_snapshot_json_from_zip(zip_path, "cli_all_apps")
+    assert data["modules"]["apps"]["winget"] == [
+        {"PackageIdentifier": "Git.Git"},
+        {"PackageIdentifier": "Discord.Discord"},
+    ]
+
+
+def test_cli_apps_from_never_invokes_checklist_run(monkeypatch, tmp_path):
+    _stub_discovery(monkeypatch)
+    checklist_calls = []
+    monkeypatch.setattr(checklist, "run", lambda *a, **kw: checklist_calls.append((a, kw)))
+
+    selection_file = tmp_path / "selection.json"
+    selection_file.write_text(json.dumps({
+        "winget": ["Git.Git"],
+        "manual": [],
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv", [
+        "export.py", "--apps-from", str(selection_file),
+        "--output", str(tmp_path),
+        "--only", "apps",
+        "--name", "cli_apps_from",
+    ])
+
+    export.main()
+
+    assert checklist_calls == []
+    zip_path = tmp_path / "cli_apps_from.winsnap"
+    assert zip_path.exists()
+    data = _read_snapshot_json_from_zip(zip_path, "cli_apps_from")
+    assert data["modules"]["apps"]["winget"] == [{"PackageIdentifier": "Git.Git"}]
+
+
+def test_cli_all_apps_and_apps_from_are_mutually_exclusive(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(sys, "argv", [
+        "export.py", "--all-apps",
+        "--apps-from", str(tmp_path / "selection.json"),
+        "--output", str(tmp_path),
+    ])
+
+    with pytest.raises(SystemExit) as exc_info:
+        export.main()
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "not allowed with argument" in captured.err
+
+
+def test_cli_name_collision_fails_fast_before_any_module_runs(monkeypatch, tmp_path, capsys):
+    _stub_discovery(monkeypatch)
+    monkeypatch.setattr(checklist, "run", _raise_if_called)
+
+    argv = [
+        "export.py", "--all-apps",
+        "--output", str(tmp_path),
+        "--only", "apps",
+        "--name", "collide",
+    ]
+
+    # First export succeeds and leaves collide.winsnap behind (the unzipped
+    # snapshot folder is cleaned up by export.main() itself, but the .winsnap
+    # archive remains -- that's the collision the second run must detect).
+    monkeypatch.setattr(sys, "argv", argv)
+    export.main()
+    zip_path = tmp_path / "collide.winsnap"
+    assert zip_path.exists()
+
+    # Second export, same --name, no --force: must fail before apps.export
+    # (or any module) runs at all.
+    module_ran = []
+    monkeypatch.setattr(apps, "_export_winget", lambda snapshot_dir: module_ran.append(1) or ([], None))
+
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc_info:
+        export.main()
+
+    assert exc_info.value.code == 1
+    assert module_ran == []
+    captured = capsys.readouterr()
+    assert str(zip_path) in captured.out
+
+    # Third export, same --name, with --force: overwrites and succeeds --
+    # apps.export legitimately runs this time (the collision was cleared),
+    # so module_ran now gains an entry.
+    monkeypatch.setattr(sys, "argv", argv + ["--force"])
+    export.main()
+    assert zip_path.exists()
+    assert module_ran == [1]
+
+
+def test_cli_snapshot_json_carries_0_3_0_format_version(monkeypatch, tmp_path):
+    _stub_discovery(monkeypatch)
+    monkeypatch.setattr(checklist, "run", _raise_if_called)
+
+    monkeypatch.setattr(sys, "argv", [
+        "export.py", "--all-apps",
+        "--output", str(tmp_path),
+        "--only", "apps",
+        "--name", "ver_test",
+    ])
+
+    export.main()
+
+    zip_path = tmp_path / "ver_test.winsnap"
+    data = _read_snapshot_json_from_zip(zip_path, "ver_test")
+    assert data["snapshot_format_version"] == "0.3.0"
+    assert data["winsnap_version"] == "0.3.0"
+
+
+def test_build_modules_names_match_manifest_order():
+    class _Args:
+        show_all = False
+        apps_selection = "all"
+        apps_from = None
+
+    built = export._build_modules(_Args())
+
+    assert [name for name, _ in built] == manifest.MODULE_NAMES
+
+
+def test_resolve_output_path_no_collision(tmp_path):
+    result = export.resolve_output_path(tmp_path, "fresh_name", force=False)
+    assert result == tmp_path / "fresh_name"
+
+
+def test_resolve_output_path_collision_raises_with_path_named(tmp_path):
+    (tmp_path / "taken").mkdir()
+
+    with pytest.raises(FileExistsError) as exc_info:
+        export.resolve_output_path(tmp_path, "taken", force=False)
+
+    assert str(tmp_path / "taken") in str(exc_info.value)
+
+
+def test_resolve_output_path_force_overwrites_existing_dir_and_zip(tmp_path):
+    (tmp_path / "taken").mkdir()
+    (tmp_path / "taken" / "leftover.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "taken.winsnap").write_text("old archive", encoding="utf-8")
+
+    result = export.resolve_output_path(tmp_path, "taken", force=True)
+
+    assert result == tmp_path / "taken"
+    assert not result.exists()
+    assert not (tmp_path / "taken.winsnap").exists()

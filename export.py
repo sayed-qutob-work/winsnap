@@ -17,6 +17,7 @@ What it does:
 
 import argparse
 import ctypes
+import importlib
 import os
 import json
 import shutil
@@ -37,16 +38,16 @@ except (AttributeError, OSError):
 # or from inside the winsnap/ folder
 sys.path.insert(0, str(Path(__file__).parent))
 
-from modules import (
-    wallpaper, apps, mouse_display, power, taskbar,
-    explorer, desktop_icons, sound_scheme, cursors,
-    fonts, startup, env_vars, region_lang,
-)
+from modules import manifest
 
 
 # Snapshot format version. Bump the MINOR when adding categories so older
 # restore.py tools can refuse newer snapshots gracefully.
-SNAPSHOT_FORMAT_VERSION = "0.2.0"
+#
+# 0.3.0: Taskband blob + pins list, accent palette fields, wallpaper
+# style/tile/sha256/image_format, bundled cursor/sound files, mouse
+# acceleration thresholds, env_vars source_profile/vars wrapper (Req 14.1).
+SNAPSHOT_FORMAT_VERSION = "0.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,44 @@ def create_snapshot_dir(base_output: Path) -> Path:
     return folder
 
 
+def resolve_output_path(output: Path, name: str, force: bool) -> Path:
+    """
+    Resolve the snapshot directory export will use when --name is given,
+    handling a pre-existing destination deterministically (Req 13.3).
+
+    If neither `<output>/<name>` (a leftover unzipped snapshot folder) nor
+    `<output>/<name>.winsnap` (a previous export) exists, this simply
+    returns `<output>/<name>`.
+
+    If either exists:
+      - force=False: raise FileExistsError naming every colliding path,
+        BEFORE any export module has run, so the caller can fail fast
+        without wasting a partial export.
+      - force=True: delete the colliding directory/file(s) and return
+        `<output>/<name>` for a fresh export to use.
+
+    This replaces the old bare `snapshot_dir.rename(named)` call, which
+    crashed with an unhelpful OSError on Windows whenever the destination
+    already existed.
+    """
+    target_dir = output / name
+    target_zip = output / f"{name}.winsnap"
+    existing = [p for p in (target_dir, target_zip) if p.exists()]
+    if existing:
+        if not force:
+            colliding = ", ".join(str(p) for p in existing)
+            raise FileExistsError(
+                f"Snapshot destination already exists: {colliding}. "
+                "Use --force to overwrite, or pick a different --name."
+            )
+        for p in existing:
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+    return target_dir
+
+
 def zip_snapshot(snapshot_dir: Path) -> Path:
     zip_path = snapshot_dir.parent / (snapshot_dir.name + ".winsnap")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -71,26 +110,29 @@ def zip_snapshot(snapshot_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Module registry
 # ---------------------------------------------------------------------------
-# Each entry: (name, callable_factory). The factory takes parsed args and
-# returns a callable export(snapshot_dir) -> dict. This lets us bind per-module
-# CLI options (e.g. show_all for apps) without forking the run loop.
+# Each entry: (name, callable). The callable takes snapshot_dir and returns
+# export(snapshot_dir) -> dict. Names and order are derived from
+# modules.manifest.MODULE_NAMES — the single source of truth shared with
+# restore.py's ALL_MODULES — so the export module *set* can never drift from
+# the restore module set (Req 2.5). Only "apps" is wrapped, to bind its
+# CLI-selected headless-selection kwargs (show_all/selection/selection_file)
+# without forking the run loop.
 
 def _build_modules(args) -> list:
-    return [
-        ("wallpaper",     wallpaper.export),
-        ("apps",          lambda d: apps.export(d, show_all=args.show_all)),
-        ("mouse_display", mouse_display.export),
-        ("power",         power.export),
-        ("taskbar",       taskbar.export),
-        ("explorer",      explorer.export),
-        ("desktop_icons", desktop_icons.export),
-        ("sound_scheme",  sound_scheme.export),
-        ("cursors",       cursors.export),
-        ("fonts",         fonts.export),
-        ("startup",       startup.export),
-        ("env_vars",      env_vars.export),
-        ("region_lang",   region_lang.export),
-    ]
+    modules = []
+    for name in manifest.MODULE_NAMES:
+        mod = importlib.import_module(f"modules.{name}")
+        if name == "apps":
+            fn = lambda d, mod=mod: mod.export(
+                d,
+                show_all=args.show_all,
+                selection=args.apps_selection,
+                selection_file=args.apps_from,
+            )
+        else:
+            fn = mod.export
+        modules.append((name, fn))
+    return modules
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +161,28 @@ def main():
               "OS components, updaters, runtimes, and MSI patches. "
               "By default these are filtered out for a cleaner list.")
     )
+    apps_selection_group = parser.add_mutually_exclusive_group()
+    apps_selection_group.add_argument(
+        "--all-apps",
+        action="store_true",
+        help=("Select every discovered winget/manual app for export without "
+              "showing the interactive checklist (headless, Req 8.1).")
+    )
+    apps_selection_group.add_argument(
+        "--apps-from",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=("Select apps to export from a JSON selection file "
+              '(`{"winget": [...], "manual": [...]}`) instead of the '
+              "interactive checklist (headless, Req 8.2).")
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=("With --name, overwrite/delete a pre-existing snapshot folder "
+              "or .winsnap file at the destination instead of failing fast.")
+    )
     parser.add_argument(
         "--skip", nargs="+", metavar="MODULE", default=[],
         help="Modules to skip during export (e.g. --skip fonts startup)"
@@ -128,6 +192,16 @@ def main():
         help="Run only these modules (e.g. --only wallpaper taskbar)"
     )
     args = parser.parse_args()
+
+    # Resolve the single "how should apps be selected" mode from the two
+    # mutually exclusive flags -- no flag keeps the interactive default
+    # (Req 8.3). _build_modules reads args.apps_selection/args.apps_from.
+    if args.all_apps:
+        args.apps_selection = "all"
+    elif args.apps_from:
+        args.apps_selection = "file"
+    else:
+        args.apps_selection = "interactive"
 
     print("=" * 55)
     print("  WinSnap — Windows Settings Exporter")
@@ -140,12 +214,22 @@ def main():
         print("  Power plan export will be skipped.")
         print("  Right-click export.py → 'Run as administrator' to include it.")
 
-    # Create working directory
-    snapshot_dir = create_snapshot_dir(args.output)
+    # Create working directory. When --name is given, resolve any collision
+    # with a pre-existing snapshot folder/.winsnap file BEFORE running any
+    # module (Req 13.3) -- this replaces the old bare
+    # `snapshot_dir.rename(named)`, which crashed with an unhelpful OSError
+    # whenever the destination already existed.
     if args.name:
-        named = snapshot_dir.parent / args.name
-        snapshot_dir.rename(named)
+        try:
+            named = resolve_output_path(args.output, args.name, args.force)
+        except FileExistsError as e:
+            print(f"\n[export] ERROR: {e}")
+            sys.exit(1)
+        args.output.mkdir(parents=True, exist_ok=True)
+        named.mkdir(parents=True, exist_ok=True)
         snapshot_dir = named
+    else:
+        snapshot_dir = create_snapshot_dir(args.output)
     print(f"\nSnapshot folder: {snapshot_dir}\n")
 
     snapshot = {

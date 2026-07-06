@@ -206,7 +206,9 @@ def test_fonts_verify_matched_on_identical_state(monkeypatch, tmp_path):
     report = fonts.verify(data, tmp_path)
 
     _assert_well_formed_report(report, phase="verify")
-    assert report["status"] == "partial"  # matched font + skipped live-load item
+    # Per the D1 aggregation rule, matched + skipped (no failed) aggregates to
+    # "matched"; the live-load aspect is still listed as an explicit skipped item.
+    assert report["status"] == "matched"
     matched_items = [i for i in report["items"] if i["status"] == "matched"]
     skipped_items = [i for i in report["items"] if i["status"] == "skipped"]
     assert matched_items and matched_items[0]["name"] == "MyFont.ttf"
@@ -336,8 +338,12 @@ def test_desktop_icons_verify_failed_on_mismatch(monkeypatch, tmp_path):
     report = desktop_icons.verify(data, tmp_path)
 
     assert report["status"] == "failed"
-    assert report["items"][0]["expected"] == 1
-    assert report["items"][0]["actual"] == 0
+    # Icons absent from the snapshot are reported as skipped items, so the
+    # recycle_bin mismatch is not necessarily items[0]; select it by name.
+    rb_item = next(i for i in report["items"] if i["name"] == "recycle_bin")
+    assert rb_item["status"] == "failed"
+    assert rb_item["expected"] == 1
+    assert rb_item["actual"] == 0
 
 
 # ===========================================================================

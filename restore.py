@@ -7,15 +7,25 @@ Usage:
     python restore.py my_snapshot.winsnap --skip apps
     python restore.py my_snapshot.winsnap --only wallpaper taskbar
     python restore.py my_snapshot.winsnap --dry-run
+    python restore.py my_snapshot.winsnap --verify
+    python restore.py my_snapshot.winsnap --verify --report-json report.json
 
 What it does:
-1. Extracts the .winsnap archive to a temp folder
-2. Reads snapshot.json
-3. Runs each module's restore() in order
-4. Cleans up the temp folder
+1. Safely extracts the .winsnap archive to a temp folder (refusing any
+   member whose path would escape the extraction directory)
+2. Locates and reads snapshot.json
+3. Runs each module's restore() in the order defined by modules/manifest.py,
+   collecting a structured per-category report instead of trusting "no
+   exception" as success
+4. Restarts Explorer exactly once, if any module's changes require it
+5. Optionally re-reads live machine state and compares it against the
+   snapshot per category (--verify)
+6. Prints a per-category summary and exits non-zero if any category failed
+7. Cleans up the temp folder
 """
 
 import argparse
+import importlib
 import json
 import shutil
 import sys
@@ -33,11 +43,7 @@ except (AttributeError, OSError):
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from modules import (
-    wallpaper, apps, mouse_display, power, taskbar,
-    explorer, desktop_icons, sound_scheme, cursors,
-    fonts, startup, env_vars, region_lang,
-)
+from modules import manifest, report, winutil, taskbar
 
 
 # Maximum snapshot format MAJOR version this restorer understands.
@@ -45,23 +51,93 @@ from modules import (
 SUPPORTED_MAJOR = 0
 
 
-# Ordered list of (key, module). Order matters for restore:
-#   - settings before things that restart Explorer
-#   - apps last (longest-running)
+# ---------------------------------------------------------------------------
+# Archive hygiene (Req 13.1, 13.2)
+# ---------------------------------------------------------------------------
+
+class ZipSlipError(Exception):
+    """
+    Raised when a .winsnap archive contains one or more members whose
+    resolved extraction path would escape the destination directory
+    (zip-slip). Carries the offending member names so the caller can report
+    exactly which entries were rejected.
+    """
+
+    def __init__(self, members: list):
+        self.members = list(members)
+        super().__init__(
+            f"archive contains {len(self.members)} unsafe member path(s): "
+            f"{', '.join(self.members)}"
+        )
+
+
+class SnapshotLayoutError(Exception):
+    """
+    Raised when no directory in an extracted .winsnap archive (neither the
+    archive root nor any of its immediate subdirectories) contains a
+    snapshot.json.
+    """
+
+
+def safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
+    """
+    Extract every member of `zf` into `dest`, refusing the entire archive if
+    any member's resolved path would land outside `dest` (zip-slip
+    protection, Req 13.1).
+
+    Policy: fail the whole restore rather than skip-and-continue -- an
+    archive containing a traversal member is treated as hostile and nothing
+    in it is trusted. Well-formed archives take the identical `extractall`
+    path, so there is no behavior change for legitimate snapshots (Req
+    13.4).
+    """
+    dest_resolved = dest.resolve()
+    bad_members = []
+    for member in zf.infolist():
+        target = (dest / member.filename).resolve()
+        try:
+            escapes = not target.is_relative_to(dest_resolved)
+        except ValueError:
+            # Different drives on Windows raise ValueError from
+            # is_relative_to rather than returning False -- treat as escape.
+            escapes = True
+        if escapes:
+            bad_members.append(member.filename)
+
+    if bad_members:
+        raise ZipSlipError(bad_members)
+
+    zf.extractall(dest)
+
+
+def find_snapshot_dir(tmp_dir: Path) -> Path:
+    """
+    Locate the directory containing snapshot.json inside an extracted
+    archive (Req 13.2): `tmp_dir` itself first (flat archives), then each
+    immediate subdirectory, in name order. Raises SnapshotLayoutError if no
+    candidate qualifies, instead of blindly picking the first extracted
+    directory.
+    """
+    if (tmp_dir / "snapshot.json").exists():
+        return tmp_dir
+
+    for child in sorted(tmp_dir.iterdir()):
+        if child.is_dir() and (child / "snapshot.json").exists():
+            return child
+
+    raise SnapshotLayoutError(
+        "no snapshot.json found in archive (checked the archive root and "
+        "every immediate subdirectory)"
+    )
+
+
+# Ordered list of (key, module), derived from the single source of truth in
+# modules/manifest.py (Req 2.1, 2.5) instead of a second hand-maintained
+# list. The public name `ALL_MODULES` and the (key, module) tuple shape are
+# preserved unchanged -- gui.py:1470 consumes this as a {key: mod} lookup.
 ALL_MODULES = [
-    ("env_vars",      env_vars),
-    ("region_lang",   region_lang),
-    ("wallpaper",     wallpaper),
-    ("mouse_display", mouse_display),
-    ("cursors",       cursors),
-    ("sound_scheme",  sound_scheme),
-    ("power",         power),
-    ("explorer",      explorer),
-    ("desktop_icons", desktop_icons),
-    ("fonts",         fonts),
-    ("startup",       startup),
-    ("taskbar",       taskbar),   # restarts Explorer — keep near end
-    ("apps",          apps),      # potentially long — keep last
+    (name, importlib.import_module(f"modules.{name}"))
+    for name in manifest.MODULE_NAMES
 ]
 
 
@@ -103,7 +179,10 @@ def _summarize(key: str, data) -> str:
             sc = len(data.get("shortcuts") or [])
             return f"would restore {reg_count} registry entry(ies), {sc} shortcut(s)"
         if key == "env_vars":
-            return f"would restore {len(data)} environment variable(s)"
+            # 0.3.0 wraps the vars map as {"source_profile", "vars"}; 0.2.0
+            # snapshots are the bare vars map itself (Req 14.2).
+            variables = data.get("vars", data)
+            return f"would restore {len(variables)} environment variable(s)"
         if key == "region_lang":
             intl    = len(data.get("international") or {})
             layouts = len(data.get("keyboard_layouts") or {})
@@ -122,6 +201,162 @@ def _summarize(key: str, data) -> str:
     if isinstance(data, list):
         return f"would restore {len(data)} item(s)"
     return f"would restore: {data!r}"
+
+
+# ---------------------------------------------------------------------------
+# Orchestration (Req 1.3, 2.1, 2.2, 7.2, 7.3, 7.4, 7.5, 7.6)
+# ---------------------------------------------------------------------------
+
+def run_modules(modules_to_run: list, modules_data: dict, snapshot_dir: Path,
+                 *, dry_run: bool) -> dict:
+    """
+    Runs restore() for each (key, mod) in `modules_to_run` whose data is
+    present in `modules_data`, returning {name: restore_report}.
+
+    While the loop runs, `taskbar.INLINE_EXPLORER_RESTART` is forced False
+    (restored in a finally) so no module restarts Explorer inline; instead
+    every module whose changes need a reload sets
+    `explorer_restart_required` on its report, and this function performs a
+    single `winutil.restart_explorer()` after all modules have run and
+    before verification (D2).
+
+    A module raising an exception does not abort the remaining modules --
+    the exception is caught and synthesized into a failed report. A module
+    that returns None (a contract violation) is recorded as skipped, never
+    as a silent success (Req 7.4).
+    """
+    if dry_run:
+        return {}
+
+    reports: dict = {}
+    previous_flag = taskbar.INLINE_EXPLORER_RESTART
+    taskbar.INLINE_EXPLORER_RESTART = False
+    try:
+        for key, mod in modules_to_run:
+            if key not in modules_data:
+                print(f"[{key}] Not found in snapshot. Skipping.")
+                continue
+
+            data = modules_data[key]
+            if isinstance(data, dict) and "error" in data:
+                print(f"[{key}] Was not captured (export error). Skipping.")
+                continue
+
+            print(f"\n[{key}] Restoring...")
+            try:
+                result = mod.restore(data, snapshot_dir)
+            except Exception as e:
+                print(f"[{key}] ERROR during restore: {e}")
+                result = {"status": "failed", "items": [], "reason": str(e)}
+
+            if result is None:
+                result = {
+                    "status": "skipped",
+                    "items": [],
+                    "reason": "module returned no report",
+                }
+
+            reports[key] = result
+    finally:
+        taskbar.INLINE_EXPLORER_RESTART = previous_flag
+
+    if any(r.get("explorer_restart_required") for r in reports.values()):
+        winutil.restart_explorer()
+
+    return reports
+
+
+def run_verify(modules_to_run: list, modules_data: dict, snapshot_dir: Path) -> dict:
+    """
+    Runs verify() for each (key, mod) in `modules_to_run` whose data is
+    present in `modules_data`, returning {name: verify_report}. Modules
+    that do not implement verify() are reported skipped -- never defaulted
+    to matched (Req 7.6). Only called when --verify is passed; --dry-run
+    bypasses both restore and verify.
+    """
+    reports: dict = {}
+    for key, mod in modules_to_run:
+        if key not in modules_data:
+            continue
+
+        data = modules_data[key]
+        if isinstance(data, dict) and "error" in data:
+            continue
+
+        verify_fn = getattr(mod, "verify", None)
+        if verify_fn is None:
+            reports[key] = {
+                "status": "skipped",
+                "reason": "verification not implemented",
+                "items": [],
+            }
+            continue
+
+        print(f"[{key}] Verifying...")
+        try:
+            reports[key] = verify_fn(data, snapshot_dir)
+        except Exception as e:
+            print(f"[{key}] ERROR during verify: {e}")
+            reports[key] = {"status": "failed", "items": [], "reason": str(e)}
+
+    return reports
+
+
+def print_summary(restore_reports: dict, verify_reports: dict) -> None:
+    """
+    Print a per-category summary table (restore status, verify status,
+    item counts) followed by per-item detail for every category whose
+    restore or verify status is partial or failed. Replaces the old
+    unconditional "Restore completed successfully!" banner (Req 7.3, 7.4).
+    """
+    print(f"\n{'='*55}")
+    print("  Restore summary")
+    print(f"{'='*55}")
+
+    ordered_keys = [name for name, _ in ALL_MODULES
+                    if name in restore_reports or name in verify_reports]
+
+    if not ordered_keys:
+        print("  No modules were run.")
+
+    for key in ordered_keys:
+        r = restore_reports.get(key)
+        v = verify_reports.get(key)
+        r_status = r["status"] if r else "not run"
+        r_items = len(r.get("items", [])) if r else 0
+        line = f"  [{key}] restore={r_status} ({r_items} item(s))"
+        if verify_reports:
+            v_status = v["status"] if v else "not run"
+            v_items = len(v.get("items", [])) if v else 0
+            line += f"  verify={v_status} ({v_items} item(s))"
+        print(line)
+
+        for phase_name, phase_report in (("restore", r), ("verify", v)):
+            if phase_report and phase_report.get("status") in ("partial", "failed"):
+                for item in phase_report.get("items", []):
+                    detail = f" -- {item['detail']}" if item.get("detail") else ""
+                    print(f"      [{phase_name}] {item['name']}: "
+                          f"{item['status']}{detail}")
+
+    print(f"{'='*55}")
+
+
+def write_report_json(path: Path, snapshot_format: str, restore_reports: dict,
+                       verify_reports: dict, exit_code: int) -> None:
+    """
+    Writes the combined restore+verify report as JSON to `path`, so a
+    scripted round trip can assert against structured data instead of
+    scraping the console banner (Req 7.7, D10).
+    """
+    payload = {
+        "snapshot_format": snapshot_format,
+        "restore": restore_reports,
+        "verify": verify_reports,
+        "exit_code": exit_code,
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def main():
@@ -146,6 +381,16 @@ def main():
         action="store_true",
         help="Show what would be restored without making any changes."
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="After restoring, re-read live machine state and compare it "
+             "against the snapshot for each restored category."
+    )
+    parser.add_argument(
+        "--report-json", type=Path, metavar="FILE", default=None,
+        help="Write the combined restore+verify report as JSON to FILE."
+    )
     args = parser.parse_args()
 
     if not args.snapshot.exists():
@@ -166,77 +411,91 @@ def main():
         if (not only or key in only) and key not in skip
     ]
 
-    # --- Extract snapshot ---
+    # --- Extract snapshot (zip-slip safe) ---
     tmp_dir = Path(tempfile.mkdtemp(prefix="winsnap_restore_"))
     print(f"\nExtracting snapshot to: {tmp_dir}")
-    with zipfile.ZipFile(args.snapshot, "r") as zf:
-        zf.extractall(tmp_dir)
-
-    # The zip contains one top-level folder named winsnap_<timestamp>
-    extracted_dirs = [d for d in tmp_dir.iterdir() if d.is_dir()]
-    if not extracted_dirs:
-        print("Error: snapshot archive appears empty.")
-        shutil.rmtree(tmp_dir)
+    try:
+        with zipfile.ZipFile(args.snapshot, "r") as zf:
+            safe_extract(zf, tmp_dir)
+    except ZipSlipError as e:
+        print("Error: archive refused -- unsafe path(s) detected "
+              "(zip-slip protection). Rejected member(s):")
+        for member in e.members:
+            print(f"    {member}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         sys.exit(1)
-    snapshot_dir = extracted_dirs[0]
+    except zipfile.BadZipFile as e:
+        print(f"Error: not a valid .winsnap archive: {e}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        sys.exit(1)
+
+    # --- Locate the snapshot content directory ---
+    try:
+        snapshot_dir = find_snapshot_dir(tmp_dir)
+    except SnapshotLayoutError as e:
+        print(f"Error: {e}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        sys.exit(1)
 
     # --- Load snapshot.json ---
-    json_path = snapshot_dir / "snapshot.json"
-    if not json_path.exists():
-        print("Error: snapshot.json not found in archive.")
-        shutil.rmtree(tmp_dir)
-        sys.exit(1)
-
-    snapshot = json.loads(json_path.read_text(encoding="utf-8"))
+    snapshot = json.loads((snapshot_dir / "snapshot.json").read_text(encoding="utf-8"))
     print(f"\nSnapshot from: {snapshot.get('exported_at', 'unknown date')}")
     print(f"WinSnap version: {snapshot.get('winsnap_version', '?')}")
     fmt_ver = snapshot.get("snapshot_format_version", "?")
     print(f"Snapshot format: {fmt_ver}\n")
 
     if not _check_format_version(snapshot):
-        shutil.rmtree(tmp_dir)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         sys.exit(2)
 
-    # --- Run restore modules (or just summarize on dry-run) ---
     modules_data = snapshot.get("modules", {})
-    errors = []
 
-    for key, mod in modules_to_run:
-        if key not in modules_data:
-            print(f"[{key}] Not found in snapshot. Skipping.")
-            continue
-        if isinstance(modules_data[key], dict) and "error" in modules_data[key]:
-            print(f"[{key}] Was not captured (export error). Skipping.")
-            continue
+    # --- Dry-run: summarize only, bypassing both restore and verify ---
+    if args.dry_run:
+        for key, mod in modules_to_run:
+            if key not in modules_data:
+                print(f"[{key}] Not found in snapshot. Skipping.")
+                continue
+            data = modules_data[key]
+            if isinstance(data, dict) and "error" in data:
+                print(f"[{key}] Was not captured (export error). Skipping.")
+                continue
+            print(f"[{key}] {_summarize(key, data)}")
 
-        if args.dry_run:
-            summary = _summarize(key, modules_data[key])
-            print(f"[{key}] {summary}")
-            continue
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        print(f"\n{'='*55}")
+        print("  Dry-run complete. Nothing was changed.")
+        print(f"{'='*55}")
+        sys.exit(0)
 
-        print(f"\n[{key}] Restoring...")
-        try:
-            mod.restore(modules_data[key], snapshot_dir)
-        except Exception as e:
-            print(f"[{key}] ERROR during restore: {e}")
-            errors.append((key, str(e)))
+    # --- Run restore modules ---
+    restore_reports = run_modules(modules_to_run, modules_data, snapshot_dir,
+                                   dry_run=False)
+
+    # --- Optionally verify, after the single Explorer restart ---
+    verify_reports = {}
+    if args.verify:
+        verify_reports = run_verify(modules_to_run, modules_data, snapshot_dir)
+
+    # Exit code is 0 only if no category failed in either phase (Req 7.5).
+    exit_code = max(
+        report.worst_exit_code(restore_reports),
+        report.worst_exit_code(verify_reports),
+    )
+
+    print_summary(restore_reports, verify_reports)
+
+    if args.report_json:
+        write_report_json(args.report_json, fmt_ver, restore_reports,
+                           verify_reports, exit_code)
 
     # --- Cleanup ---
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    print(f"\n{'='*55}")
-    if args.dry_run:
-        print("  Dry-run complete. Nothing was changed.")
-    elif errors:
-        print(f"  Restore completed with {len(errors)} error(s):")
-        for key, err in errors:
-            print(f"    [{key}] {err}")
-    else:
-        print("  Restore completed successfully!")
-    print(f"{'='*55}")
-    if not args.dry_run:
-        print("\nNote: Some changes (DPI, theme, env vars) may require a "
-              "logout/restart to fully apply.")
+    print("\nNote: Some changes (theme, env vars) may require a "
+          "logout/restart to fully apply.")
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

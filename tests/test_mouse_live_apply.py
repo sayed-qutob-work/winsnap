@@ -30,6 +30,7 @@ Covers:
 
 import ctypes
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -57,6 +58,7 @@ def _patch_ctypes(monkeypatch, user32_obj):
     monkeypatch.setattr(md.ctypes, "windll", mock_windll)
 
 
+@dataclass
 class _FailingActionUser32(FakeUser32):
     """FakeUser32 variant whose SystemParametersInfoW reports failure (0)
     for a chosen set of SPI action codes, success (1) for everything else."""
@@ -67,6 +69,7 @@ class _FailingActionUser32(FakeUser32):
         return 0 if action in self.failing_actions else 1
 
 
+@dataclass
 class _GetMouseSpeedUser32(FakeUser32):
     """FakeUser32 variant that answers SPI_GETMOUSESPEED by writing a fixed
     value into the caller's pvParam pointer, mimicking the real API filling

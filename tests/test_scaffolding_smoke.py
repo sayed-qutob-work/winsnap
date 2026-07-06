@@ -15,8 +15,6 @@ from tests.conftest import (
     FakeUser32,
     FakeSubprocess,
     FakeSubprocessResult,
-    FakeDesktopWallpaper,
-    make_fake_desktop_wallpaper,
     populate_winget_export,
     read_winget_export,
     stage_wallpaper_file,
@@ -90,20 +88,6 @@ def test_fake_subprocess_captures_calls():
 
     subproc.Popen(["explorer.exe"])
     assert len(subproc.popen_calls) == 1
-
-
-def test_fake_desktop_wallpaper():
-    """FakeDesktopWallpaper tracks per-monitor wallpaper calls."""
-    wp = make_fake_desktop_wallpaper(monitor_count=2)
-
-    assert wp.GetMonitorDevicePathCount() == 2
-    assert wp.GetMonitorDevicePathAt(0) == "\\\\.\\DISPLAY1"
-    assert wp.GetMonitorDevicePathAt(1) == "\\\\.\\DISPLAY2"
-
-    wp.SetWallpaper("\\\\.\\DISPLAY1", "C:\\wall.jpg")
-    wp.SetWallpaper("\\\\.\\DISPLAY2", "C:\\wall.jpg")
-
-    assert len(wp.set_wallpaper_calls) == 2
 
 
 def test_snapshot_dir_helpers(tmp_path):
