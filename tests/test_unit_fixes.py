@@ -25,12 +25,12 @@ from tests.conftest import (
     FakeWinReg,
     FakeUser32,
     FakeSubprocess,
-    FakeDesktopWallpaper,
     _build_winreg_module,
     read_winget_export,
     stage_wallpaper_file,
     stage_taskbar_pins,
 )
+from modules import winutil
 
 
 # ===========================================================================
@@ -271,47 +271,20 @@ class TestMouseAccelerationFix:
 # ===========================================================================
 
 class TestWallpaperMultiMonitorFix:
-    """Validates: Requirements 2.3, 3.1"""
+    """Validates: Requirements 2.3, 3.1
 
-    def test_per_monitor_path_when_multiple_monitors(self, tmp_path, monkeypatch):
-        """When monitor count > 1, the per-monitor IDesktopWallpaper path is used."""
-        from modules import wallpaper
-
-        snapshot_dir = tmp_path / "snapshot"
-        snapshot_dir.mkdir()
-        stage_wallpaper_file(snapshot_dir, "wallpaper.jpg")
-
-        snapshot = {"enabled": True, "filename": "wallpaper.jpg"}
-
-        # Mock GetSystemMetrics to return 2 monitors
-        fake_u32 = FakeUser32()
-        fake_u32.metrics[80] = 2  # SM_CMONITORS
-
-        mock_windll = MagicMock()
-        mock_windll.user32 = fake_u32
-        monkeypatch.setattr(wallpaper.ctypes, "windll", mock_windll)
-
-        # Mock the COM path
-        fake_wp = FakeDesktopWallpaper(monitor_count=2)
-        mock_comtypes = MagicMock()
-        mock_comtypes.GUID = MagicMock(side_effect=lambda x: x)
-        mock_comtypes.CoCreateInstance = MagicMock(return_value=fake_wp)
-        monkeypatch.setitem(sys.modules, "comtypes", mock_comtypes)
-
-        # Mock Path.home() to use tmp_path
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        wallpaper.restore(snapshot, snapshot_dir)
-
-        # Per-monitor path should have been used
-        assert len(fake_wp.set_wallpaper_calls) == 2, \
-            "Per-monitor SetWallpaper should be called for each monitor"
-
-        # Legacy SPI_SETDESKWALLPAPER should NOT have been called
-        SPI_SETDESKWALLPAPER = 0x0014
-        legacy_calls = fake_u32.get_spi_calls_for(SPI_SETDESKWALLPAPER)
-        assert len(legacy_calls) == 0, \
-            "Legacy SPI_SETDESKWALLPAPER should NOT be called on multi-monitor"
+    Note (backend-roundtrip-hardening, Task 6, Req 5.5/5.6): the per-monitor
+    `IDesktopWallpaper` COM path this class used to exercise was removed
+    entirely -- it was provably dead code (comtypes.CoCreateInstance was
+    handed a bare GUID rather than an interface class, so it threw on every
+    real machine). `wallpaper.restore()` now always drives the legacy
+    SystemParametersInfoW(SPI_SETDESKWALLPAPER) path regardless of monitor
+    count. The former `test_per_monitor_path_when_multiple_monitors` and
+    `test_com_fallback_to_legacy` tests exercised that deleted COM surface
+    and have been removed; the current contract (no comtypes import, legacy
+    SPI call regardless of monitor count) is covered by
+    `tests/test_wallpaper_multimon_bug.py`.
+    """
 
     def test_legacy_path_when_single_monitor(self, tmp_path, monkeypatch):
         """When monitor count <= 1, the legacy SPI_SETDESKWALLPAPER path is used."""
@@ -381,42 +354,6 @@ class TestWallpaperMultiMonitorFix:
         assert len(fake_u32.spi_calls) == 0, \
             "No SPI calls when wallpaper file is missing"
 
-    def test_com_fallback_to_legacy(self, tmp_path, monkeypatch):
-        """When COM fails on multi-monitor, falls back to legacy API."""
-        from modules import wallpaper
-
-        snapshot_dir = tmp_path / "snapshot"
-        snapshot_dir.mkdir()
-        stage_wallpaper_file(snapshot_dir, "wallpaper.jpg")
-
-        snapshot = {"enabled": True, "filename": "wallpaper.jpg"}
-
-        # Mock GetSystemMetrics to return 2 monitors
-        fake_u32 = FakeUser32()
-        fake_u32.metrics[80] = 2
-
-        mock_windll = MagicMock()
-        mock_windll.user32 = fake_u32
-        monkeypatch.setattr(wallpaper.ctypes, "windll", mock_windll)
-
-        # Mock COM to raise an exception
-        mock_comtypes = MagicMock()
-        mock_comtypes.GUID = MagicMock(side_effect=lambda x: x)
-        mock_comtypes.CoCreateInstance = MagicMock(side_effect=Exception("COM unavailable"))
-        monkeypatch.setitem(sys.modules, "comtypes", mock_comtypes)
-
-        # Mock Path.home() to use tmp_path
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        wallpaper.restore(snapshot, snapshot_dir)
-
-        # Fallback: legacy SPI_SETDESKWALLPAPER should be called
-        SPI_SETDESKWALLPAPER = 0x0014
-        legacy_calls = fake_u32.get_spi_calls_for(SPI_SETDESKWALLPAPER)
-        assert len(legacy_calls) == 1, \
-            "Should fall back to legacy API when COM fails"
-
-
 # ===========================================================================
 # 4. Taskbar tolerant copy fix — taskbar.restore
 # ===========================================================================
@@ -445,7 +382,7 @@ class TestTaskbarTolerantCopyFix:
         theme_mock = MagicMock()
         explorer_mock = MagicMock()
         monkeypatch.setattr(taskbar, "_write_theme_settings", theme_mock)
-        monkeypatch.setattr(taskbar, "_restart_explorer", explorer_mock)
+        monkeypatch.setattr(winutil, "restart_explorer", explorer_mock)
 
         snapshot = {
             "pins_backup": "taskbar_pins",
@@ -483,7 +420,7 @@ class TestTaskbarTolerantCopyFix:
         theme_mock = MagicMock()
         explorer_mock = MagicMock()
         monkeypatch.setattr(taskbar, "_write_theme_settings", theme_mock)
-        monkeypatch.setattr(taskbar, "_restart_explorer", explorer_mock)
+        monkeypatch.setattr(winutil, "restart_explorer", explorer_mock)
 
         # Patch shutil.copy2 to raise PermissionError for Bad.lnk
         original_copy2 = shutil.copy2
@@ -528,7 +465,7 @@ class TestTaskbarTolerantCopyFix:
         theme_mock = MagicMock()
         explorer_mock = MagicMock()
         monkeypatch.setattr(taskbar, "_write_theme_settings", theme_mock)
-        monkeypatch.setattr(taskbar, "_restart_explorer", explorer_mock)
+        monkeypatch.setattr(winutil, "restart_explorer", explorer_mock)
 
         snapshot = {
             "pins_backup": "taskbar_pins",
@@ -565,7 +502,7 @@ class TestTaskbarTolerantCopyFix:
         theme_mock = MagicMock()
         explorer_mock = MagicMock()
         monkeypatch.setattr(taskbar, "_write_theme_settings", theme_mock)
-        monkeypatch.setattr(taskbar, "_restart_explorer", explorer_mock)
+        monkeypatch.setattr(winutil, "restart_explorer", explorer_mock)
 
         snapshot = {
             "pins_backup": "taskbar_pins",
@@ -595,7 +532,7 @@ class TestTaskbarTolerantCopyFix:
         theme_mock = MagicMock()
         explorer_mock = MagicMock()
         monkeypatch.setattr(taskbar, "_write_theme_settings", theme_mock)
-        monkeypatch.setattr(taskbar, "_restart_explorer", explorer_mock)
+        monkeypatch.setattr(winutil, "restart_explorer", explorer_mock)
 
         snapshot = {
             "pins_backup": None,

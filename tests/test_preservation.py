@@ -4,8 +4,9 @@ Property-based preservation tests for non-buggy inputs (Property 5).
 **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6**
 
 Goal: Confirm that for all inputs where NONE of the four bug conditions hold,
-the current (unfixed) code produces specific observable outputs. These tests
-capture the baseline behavior that must be preserved after the fixes are applied.
+apps.py/mouse_display.py/wallpaper.py/taskbar.py/startup.py produce specific
+observable outputs. These tests capture the baseline behavior that must be
+preserved after the fixes are applied.
 
 Non-bug-condition inputs:
   - Winget: any package selection (the Packages/SourceDetails content is preserved)
@@ -14,7 +15,20 @@ Non-bug-condition inputs:
   - Taskbar: pins backup with only .lnk files (no uncopyable files)
   - Startup: entries referencing missing binaries are skipped
 
-These tests are EXPECTED TO PASS on unfixed code — they capture what must not change.
+Post-hardening note (backend-roundtrip-hardening, Task 17): these tests
+originally asserted on printed stdout text (e.g. "No winget apps to
+install.", "installed successfully") because that was how the pre-hardening
+modules communicated outcomes. Req 7's reporting overhaul replaced ad hoc
+prints with structured `Report` dicts (`restore()`/`verify()` now return
+`{"status", "reason", "items": [...]}"`), and Req 11.1 removed the dead
+LogPixels/DpiScaling "DPI restore" coverage entirely. The assertions below
+have been updated to read the returned report (status/items/detail) instead
+of stdout where the old print no longer exists, and the LogPixels
+expectation has been replaced with an assertion that it is never written.
+The underlying property under test (content/ordering preserved, non-bug-
+condition fields still applied, missing-binary entries still skipped) is
+unchanged; only the observation mechanism was updated to match the new
+contract.
 """
 
 import json
@@ -38,6 +52,7 @@ from tests.conftest import (
     FakeWinReg,
     FakeUser32,
     FakeSubprocess,
+    FakeSubprocessResult,
     _build_winreg_module,
 )
 
@@ -145,13 +160,15 @@ def test_winget_package_content_preserved(tmp_path, selected):
 # Preservation Test 2: Empty winget selection yields "No winget apps" path
 # ===========================================================================
 
-def test_winget_empty_selection_no_install_path(tmp_path, capsys):
+def test_winget_empty_selection_no_install_path(tmp_path, capsys, monkeypatch):
     """
-    Property 5 (Preservation): Empty selection yields "No winget apps to install."
+    Property 5 (Preservation): Empty selection yields an empty, skipped report.
 
     **Validates: Requirements 3.3, 3.6**
 
-    When the winget selection is empty, apps.restore prints the no-install message.
+    When the winget selection (and manual list) is empty, apps.restore installs
+    nothing and no install-count message is printed; the returned report has
+    no items and rolls up to "skipped" (Req 7's empty-report aggregation rule).
     """
     from modules import apps
 
@@ -161,12 +178,18 @@ def test_winget_empty_selection_no_install_path(tmp_path, capsys):
     # No winget_export.json and empty winget list
     snapshot = {"winget": [], "manual": []}
 
+    # winget must be "present" so we exercise the empty-selection path rather
+    # than the winget-absent skip_all path.
+    monkeypatch.setattr(apps.shutil, "which", lambda name: r"C:\winget.exe")
+
     # Mock subprocess so we don't actually call winget
     with patch.object(apps, "subprocess", MagicMock()):
-        apps.restore(snapshot, snapshot_dir)
+        result = apps.restore(snapshot, snapshot_dir)
 
     captured = capsys.readouterr()
-    assert "No winget apps to install." in captured.out
+    assert "Installing" not in captured.out
+    assert result["items"] == []
+    assert result["status"] == "skipped"
 
 
 # ===========================================================================
@@ -194,8 +217,13 @@ def test_mouse_keyboard_display_preservation(
 
     With enhance_precision == None (non-bug-condition), the exact set of registry
     writes for MouseSensitivity, DoubleClickSpeed, SwapMouseButtons, WheelScrollLines,
-    KeyboardDelay, KeyboardSpeed, LogPixels and the WM_SETTINGCHANGE broadcast
-    must occur as observed on the unfixed code.
+    KeyboardDelay, KeyboardSpeed and the WM_SETTINGCHANGE broadcast must occur.
+
+    LogPixels is a separate case: Req 11.1 removed the dead DPI "restore" entirely
+    (it was captured but never applied on modern Windows), so LogPixels must NEVER
+    be written regardless of the legacy "display" key's content, and the module
+    instead records the legacy "display" key as an explicitly skipped "dpi" item
+    (Req 11.3) rather than presenting it as covered.
     """
     from modules import mouse_display
 
@@ -226,7 +254,7 @@ def test_mouse_keyboard_display_preservation(
 
     with patch.object(mouse_display, "winreg", mock_winreg), \
          patch.object(mouse_display, "ctypes", mock_ctypes):
-        mouse_display.restore(snapshot, tmp_path)
+        report = mouse_display.restore(snapshot, tmp_path)
 
     # Verify: each non-None field was written
     if speed is not None:
@@ -271,12 +299,16 @@ def test_mouse_keyboard_display_preservation(
     else:
         assert len(fake_reg.get_writes_for("KeyboardSpeed")) == 0
 
-    if log_px is not None:
-        writes = fake_reg.get_writes_for("LogPixels")
-        assert len(writes) == 1, "Expected LogPixels write"
-        assert writes[0][5] == log_px
-    else:
-        assert len(fake_reg.get_writes_for("LogPixels")) == 0
+    # Req 11.1: LogPixels is dead DPI coverage and must never be written,
+    # regardless of what the legacy "display" key carries.
+    assert len(fake_reg.get_writes_for("LogPixels")) == 0, (
+        "LogPixels must never be written -- DPI restore was removed (Req 11.1)"
+    )
+    # Req 11.3: the legacy "display" key is reported as an explicit skipped
+    # "dpi" item, not silently dropped or presented as covered.
+    dpi_items = [i for i in report["items"] if i["name"] == "dpi"]
+    assert len(dpi_items) == 1
+    assert dpi_items[0]["status"] == "skipped"
 
     # Verify: WM_SETTINGCHANGE broadcast always happens
     assert len(fake_u32.send_message_calls) == 1, "Expected exactly one WM_SETTINGCHANGE broadcast"
@@ -372,15 +404,18 @@ def test_wallpaper_disabled_guard(tmp_path, capsys):
 
     **Validates: Requirements 3.1**
 
-    When wallpaper is not enabled, restore does nothing.
+    When wallpaper is not enabled, restore does nothing and reports the whole
+    category skipped with a reason (Req 7 Report contract; there is no print
+    for this guard, only the returned report).
     """
     from modules import wallpaper
 
     snapshot = {"enabled": False}
-    wallpaper.restore(snapshot, tmp_path)
+    result = wallpaper.restore(snapshot, tmp_path)
 
-    captured = capsys.readouterr()
-    assert "Nothing to restore" in captured.out
+    assert result["status"] == "skipped"
+    assert "disabled" in result["reason"]
+    assert result["items"] == []
 
 
 def test_wallpaper_missing_file_guard(tmp_path, capsys):
@@ -389,7 +424,9 @@ def test_wallpaper_missing_file_guard(tmp_path, capsys):
 
     **Validates: Requirements 3.1**
 
-    When the wallpaper file doesn't exist in snapshot_dir, restore reports and returns.
+    When the wallpaper file doesn't exist in snapshot_dir, restore records a
+    failed "file copy" item with the missing path (Req 7 Report contract;
+    there is no print for this guard, only the returned report).
     """
     from modules import wallpaper
 
@@ -399,23 +436,26 @@ def test_wallpaper_missing_file_guard(tmp_path, capsys):
         "original_path": "C:\\somewhere\\wall.jpg",
     }
 
-    wallpaper.restore(snapshot, tmp_path)
+    result = wallpaper.restore(snapshot, tmp_path)
 
-    captured = capsys.readouterr()
-    assert "missing from snapshot" in captured.out
+    items = {i["name"]: i for i in result["items"]}
+    assert items["file copy"]["status"] == "failed"
+    assert "missing from snapshot" in items["file copy"]["detail"]
 
 
 # ===========================================================================
 # Preservation Test 6: Manual app reporting preserved
 # ===========================================================================
 
-def test_manual_app_reporting_preserved(tmp_path, capsys):
+def test_manual_app_reporting_preserved(tmp_path, capsys, monkeypatch):
     """
-    Property 5 (Preservation): Manual install list output unchanged.
+    Property 5 (Preservation): Manual install list reported, never as a failure.
 
     **Validates: Requirements 3.3**
 
-    When manual apps are present, apps.restore prints each name and URL.
+    When manual apps are present, apps.restore records each as a skipped
+    report item carrying its name and URL (Req 7 Report contract; the old
+    "manual installation" print no longer exists).
     """
     from modules import apps
 
@@ -428,19 +468,19 @@ def test_manual_app_reporting_preserved(tmp_path, capsys):
     ]
 
     snapshot = {"winget": [], "manual": manual_apps}
+    monkeypatch.setattr(apps.shutil, "which", lambda name: r"C:\winget.exe")
 
     with patch.object(apps, "subprocess", MagicMock()):
-        apps.restore(snapshot, snapshot_dir)
+        result = apps.restore(snapshot, snapshot_dir)
 
-    captured = capsys.readouterr()
-    assert "manual installation" in captured.out.lower()
-    assert "CustomApp" in captured.out
-    assert "https://example.com/custom" in captured.out
-    assert "AnotherApp" in captured.out
-    assert "https://example.com/another" in captured.out
+    items = {i["name"]: i for i in result["items"]}
+    assert items["CustomApp"]["status"] == "skipped"
+    assert "https://example.com/custom" in items["CustomApp"]["detail"]
+    assert items["AnotherApp"]["status"] == "skipped"
+    assert "https://example.com/another" in items["AnotherApp"]["detail"]
 
 
-def test_manual_app_no_url_preserved(tmp_path, capsys):
+def test_manual_app_no_url_preserved(tmp_path, capsys, monkeypatch):
     """
     Property 5 (Preservation): Manual apps without URL show "no URL saved".
 
@@ -453,13 +493,14 @@ def test_manual_app_no_url_preserved(tmp_path, capsys):
 
     manual_apps = [{"name": "NoUrlApp"}]
     snapshot = {"winget": [], "manual": manual_apps}
+    monkeypatch.setattr(apps.shutil, "which", lambda name: r"C:\winget.exe")
 
     with patch.object(apps, "subprocess", MagicMock()):
-        apps.restore(snapshot, snapshot_dir)
+        result = apps.restore(snapshot, snapshot_dir)
 
-    captured = capsys.readouterr()
-    assert "NoUrlApp" in captured.out
-    assert "no URL saved" in captured.out
+    item = next(i for i in result["items"] if i["name"] == "NoUrlApp")
+    assert item["status"] == "skipped"
+    assert "no URL saved" in item["detail"]
 
 
 # ===========================================================================
@@ -479,7 +520,7 @@ def test_taskbar_normal_pins_preservation(tmp_path, lnk_names):
     the taskbar restore copies all shortcuts, writes theme settings, and
     restarts Explorer.
     """
-    from modules import taskbar
+    from modules import taskbar, winutil
 
     snapshot_dir = tmp_path / f"snapshot_{os.urandom(8).hex()}"
     snapshot_dir.mkdir(exist_ok=True)
@@ -509,7 +550,7 @@ def test_taskbar_normal_pins_preservation(tmp_path, lnk_names):
     fake_reg = FakeWinReg()
     mock_winreg = _build_winreg_module(fake_reg)
 
-    # Track whether _restart_explorer was called
+    # Track whether winutil.restart_explorer was called
     explorer_restarted = []
 
     def mock_restart_explorer():
@@ -517,7 +558,7 @@ def test_taskbar_normal_pins_preservation(tmp_path, lnk_names):
 
     with patch.object(taskbar, "winreg", mock_winreg), \
          patch.object(taskbar, "TASKBAR_PINS_DIR", fake_pins_target), \
-         patch.object(taskbar, "_restart_explorer", mock_restart_explorer):
+         patch.object(winutil, "restart_explorer", mock_restart_explorer):
         taskbar.restore(snapshot, snapshot_dir)
 
     # Assert: All .lnk files were copied to the target
@@ -550,8 +591,10 @@ def test_startup_skips_missing_binary(tmp_path, capsys):
 
     **Validates: Requirements 3.5**
 
-    When a startup registry entry references a binary that doesn't exist,
-    the system skips it with a warning. This is expected behavior, not a defect.
+    When a startup registry entry references a binary that doesn't exist, the
+    system skips it (Req 7 Report contract: a skipped report item carrying
+    "binary not found: <command>" in its detail) rather than writing it or
+    raising. This is expected behavior, not a defect.
     """
     from modules import startup
 
@@ -579,23 +622,32 @@ def test_startup_skips_missing_binary(tmp_path, capsys):
     mock_winreg.REG_SZ = 1
 
     with patch.object(startup, "winreg", mock_winreg):
-        startup.restore(snapshot, snapshot_dir)
+        result = startup.restore(snapshot, snapshot_dir)
 
-    captured = capsys.readouterr()
-    # Both entries should be skipped because their binaries don't exist
-    assert "Skipping" in captured.out
-    assert "binary not found" in captured.out
+    # Both entries should be skipped because their binaries don't exist.
+    # Item names are namespaced "<Run-key label>:<value name>".
+    items = {i["name"]: i for i in result["items"]}
+    assert items["Run:NonExistentApp"]["status"] == "skipped"
+    assert "binary not found" in items["Run:NonExistentApp"]["detail"]
+    assert items["Run:AnotherMissing"]["status"] == "skipped"
+    assert "binary not found" in items["Run:AnotherMissing"]["detail"]
+    # No matched/failed items present -> the whole category rolls up skipped.
+    assert result["status"] == "skipped"
 
 
 # ===========================================================================
 # Preservation Test 9: Winget success/failure reporting
 # ===========================================================================
 
-def test_winget_success_reporting(tmp_path, capsys):
+def test_winget_success_reporting(tmp_path, capsys, monkeypatch):
     """
-    Property 5 (Preservation): Winget success message on returncode == 0.
+    Property 5 (Preservation): Winget package reported matched on returncode == 0.
 
     **Validates: Requirements 3.6**
+
+    Req 7 replaced the old "installed successfully" print with a report item;
+    `result.stdout`/`result.stderr` must also be real strings (not absent
+    attributes) since restore() reads them to classify the outcome (Req 3.3).
     """
     from modules import apps
 
@@ -607,26 +659,32 @@ def test_winget_success_reporting(tmp_path, capsys):
     winget_file.write_text(json.dumps({"Sources": [{"Packages": [{"PackageIdentifier": "Git.Git"}]}]}))
 
     snapshot = {"winget": [{"PackageIdentifier": "Git.Git"}], "manual": []}
+    monkeypatch.setattr(apps.shutil, "which", lambda name: r"C:\winget.exe")
 
     fake_subproc = FakeSubprocess()
-    # run returns success
-    fake_subproc.run_side_effect = lambda args, **kw: type('R', (), {'returncode': 0})()
+    # run returns success, with real stdout/stderr text (capture_output=True)
+    fake_subproc.run_side_effect = lambda args, **kw: FakeSubprocessResult(
+        returncode=0, stdout="Successfully installed", stderr="")
 
     mock_subprocess = MagicMock()
     mock_subprocess.run = fake_subproc.run
 
     with patch.object(apps, "subprocess", mock_subprocess):
-        apps.restore(snapshot, snapshot_dir)
+        result = apps.restore(snapshot, snapshot_dir)
 
-    captured = capsys.readouterr()
-    assert "installed successfully" in captured.out
+    item = next(i for i in result["items"] if i["name"] == "Git.Git")
+    assert item["status"] == "matched"
+    assert "installed" in item["detail"]
+    assert result["status"] == "matched"
 
 
-def test_winget_failure_reporting(tmp_path, capsys):
+def test_winget_failure_reporting(tmp_path, capsys, monkeypatch):
     """
-    Property 5 (Preservation): Winget warning on non-zero returncode.
+    Property 5 (Preservation): Winget package reported failed on non-zero returncode.
 
     **Validates: Requirements 3.6**
+
+    Req 7 replaced the old "may have failed" print with a failed report item.
     """
     from modules import apps
 
@@ -638,12 +696,16 @@ def test_winget_failure_reporting(tmp_path, capsys):
     winget_file.write_text(json.dumps({"Sources": [{"Packages": [{"PackageIdentifier": "Git.Git"}]}]}))
 
     snapshot = {"winget": [{"PackageIdentifier": "Git.Git"}], "manual": []}
+    monkeypatch.setattr(apps.shutil, "which", lambda name: r"C:\winget.exe")
 
     mock_subprocess = MagicMock()
-    mock_subprocess.run = MagicMock(return_value=type('R', (), {'returncode': 1})())
+    mock_subprocess.run = MagicMock(return_value=FakeSubprocessResult(
+        returncode=1, stdout="some other winget failure", stderr="boom"))
 
     with patch.object(apps, "subprocess", mock_subprocess):
-        apps.restore(snapshot, snapshot_dir)
+        result = apps.restore(snapshot, snapshot_dir)
 
-    captured = capsys.readouterr()
-    assert "may have failed" in captured.out
+    item = next(i for i in result["items"] if i["name"] == "Git.Git")
+    assert item["status"] == "failed"
+    assert "returncode=1" in item["detail"]
+    assert result["status"] == "failed"

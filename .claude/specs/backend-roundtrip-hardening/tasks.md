@@ -144,17 +144,17 @@ File-conflict rules for parallel agents: only Task 3 and Task 6 edit `tests/conf
 
 ## Phase D — Cross-cutting tests and round-trip harness (requires Phase C; parallel with each other)
 
-- [ ] 14. Cross-module invariant tests: `tests/test_ordering.py` and `tests/test_verify_readonly.py`
+- [x] 14. Cross-module invariant tests: `tests/test_ordering.py` and `tests/test_verify_readonly.py`
   - `tests/test_ordering.py`: `manifest.MODULE_NAMES` drives both `restore.ALL_MODULES` (keys equal, in order) and `export._build_modules` (names equal, in order); `MODULE_NAMES.index("apps")` is less than the indexes of `startup` and `taskbar`; an orchestrated restore (stub modules whose reports request a restart) produces exactly one `restart_explorer` call, positioned after all module restores and before any verify call (call sequence recorded via monkeypatched winutil and stub modules).
   - `tests/test_verify_readonly.py`: for every module in `manifest.MODULE_NAMES` that defines `verify`, call it against a populated fake registry/filesystem snapshot and assert `fake_winreg.writes == []` afterward (the D10 read-only invariant); also assert no `subprocess` call other than the allowed read-only ones (`powercfg /getactivescheme`, `winget list`).
   - _Requirements: 2.1, 2.2, 2.5, 7.2, 15.4_  _Design: D2, D10, Testing Strategy_
 
-- [ ] 15. Backward-compatibility suite: `tests/test_compat_020.py`
+- [x] 15. Backward-compatibility suite: `tests/test_compat_020.py`
   - Using `stage_v020_snapshot` (Task 3), build a full 0.2.0-shape snapshot covering: flat env_vars map, taskbar without `pins`/`taskband`/accent fields, wallpaper without `style`/`tile`/`image_format`/`sha256`, mouse_display with legacy `display`/`cursor_scheme`, cursors/sound_scheme without `bundled`.
   - Assert: every module's `restore()` completes without exception and returns a report; every new-field portion is reported `skipped` with a reason (never `matched`, never `failed`) in both restore and verify phases (Req 14.2, 14.4, 1.5, 9.3, 11.3); a snapshot with `snapshot_format_version: "1.0.0"` makes `restore.main()` exit 2 before any module runs (Req 14.3).
   - _Requirements: 1.5, 9.3, 11.3, 14.2, 14.3, 14.4_  _Design: D7_
 
-- [ ] 16. Round-trip harness: `tests/test_roundtrip_mocked.py` and `scripts/roundtrip_check.py`
+- [x] 16. Round-trip harness: `tests/test_roundtrip_mocked.py` and `scripts/roundtrip_check.py`
   - `tests/test_roundtrip_mocked.py` (CI-safe, definition of done in mocked form): drive `export.main()` with `--all-apps --output <tmp> --name rt --force` then `restore.main()` on the produced `.winsnap` with `--verify --report-json <tmp>/report.json`, with winreg/user32/subprocess/TTY fully mocked via conftest fixtures; assert `SystemExit(0)` and, from the structured report JSON, that **every** category in both `restore` and `verify` sections is `matched` or `skipped` with a non-empty reason — never `failed`, and `skipped` never without reason (Req 7.7, 15.5).
   - Create `scripts/roundtrip_check.py` (real-machine executable): run `python export.py --all-apps --output <tmp> --name rt_check --force`, then `python restore.py <tmp>/rt_check.winsnap --verify --report-json <tmp>/rt_report.json`; support a `--skip MODULE...` pass-through (default: skip `apps power` for quick runs, overridable with `--full`); parse the report JSON, assert exit code 0 and every category matched-or-skipped-with-reason; print a single PASS/FAIL line and exit 0/1 accordingly. Coding-only: the script is written and unit-smoke-tested for its report-parsing/verdict function (pure function, testable in `test_roundtrip_mocked.py`); it is not executed against the real machine as part of this plan.
   - _Requirements: 7.5, 7.7, 15.5_  _Design: Testing Strategy (round-trip harness)_

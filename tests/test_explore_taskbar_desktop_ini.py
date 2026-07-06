@@ -6,12 +6,23 @@ Bug Condition Exploration Test — Taskbar restore aborts on uncopyable desktop.
 Property 4: Bug Condition — Taskbar restore tolerates uncopyable files
 
 For any pins backup folder that contains a file which cannot be copied due to
-permissions (e.g. a hidden/system desktop.ini raising Errno 13), the fixed
-taskbar.restore SHALL skip that file, complete the copy of the remaining pinned
-.lnk shortcuts, and continue to theme writes and Explorer restart without aborting.
+permissions (e.g. a hidden/system desktop.ini raising Errno 13), taskbar.restore
+SHALL skip that file, complete the copy of the remaining pinned .lnk shortcuts,
+and continue to theme writes and Explorer restart without aborting.
 
-EXPECTED OUTCOME on UNFIXED code: Test FAILS because the PermissionError on
-desktop.ini propagates and aborts the restore before theme writes / Explorer restart.
+Post-hardening note (backend-roundtrip-hardening, Task 9): the original
+unfixed code copied the whole pins folder via `shutil.copytree`, so a single
+uncopyable member (like a hidden/system desktop.ini) raised PermissionError
+and aborted the entire restore before theme/Explorer-restart ran. The current
+`taskbar._copy_pins_tolerant` instead walks the backup directory and copies
+only `.lnk` files one at a time via `shutil.copy2`; desktop.ini (and anything
+else that isn't a `.lnk`) is skipped by extension check and is never even
+attempted, so simulating a `copytree`-level PermissionError no longer
+reflects how the module operates. This test now drives the real
+`_copy_pins_tolerant` code path directly and asserts the same durable
+property: a non-essential file present in the pins backup never aborts the
+restore, every `.lnk` still lands in the target directory, and theme write +
+Explorer restart still run to completion (Req 1.4, 2.4).
 """
 
 import sys
@@ -82,15 +93,18 @@ class TestTaskbarDesktopIniBugCondition:
     ):
         """
         For any pins backup containing .lnk shortcuts plus a desktop.ini that
-        raises PermissionError on copy, assert:
+        would raise PermissionError if ever copied, assert:
           1. The restore completes without raising (no abort)
           2. All .lnk pins are restored to the target directory
-          3. _write_theme_settings is called with the theme data
-          4. _restart_explorer is called
+          3. desktop.ini is never copied into the target (skipped as
+             non-essential, never even attempted)
+          4. _write_theme_settings is called with the theme data
+          5. winutil.restart_explorer is called
 
-        On UNFIXED code this MUST FAIL because shutil.copytree raises
-        PermissionError on desktop.ini and the exception propagates, aborting
-        before theme writes and Explorer restart.
+        Drives the real `_copy_pins_tolerant` code path (no copytree/copy2
+        patching needed): desktop.ini is filtered out by extension before any
+        copy is attempted, so the restore never even risks the
+        PermissionError this test used to have to simulate.
         """
         # Create a unique temp dir for this example
         tmp_path = tmp_path_factory.mktemp("taskbar")
@@ -105,7 +119,7 @@ class TestTaskbarDesktopIniBugCondition:
         for name in lnk_names:
             (pins_backup / name).write_bytes(b"\x4c\x00\x00\x00" + b"\x00" * 50)
 
-        # Create desktop.ini (the uncopyable file)
+        # Create desktop.ini (the non-essential file that must be skipped)
         desktop_ini = pins_backup / "desktop.ini"
         desktop_ini.write_text(
             "[.ShellClassInfo]\nIconResource=imageres.dll,-1023\n",
@@ -122,30 +136,11 @@ class TestTaskbarDesktopIniBugCondition:
         fake_pins_target = tmp_path / "target_pins"
         fake_pins_target.mkdir(parents=True)
 
-        # --- Patch shutil.copytree to raise PermissionError on desktop.ini ---
-        original_copytree = shutil.copytree
-
-        def patched_copytree(src, dst, **kwargs):
-            """
-            Wrap copytree so that copying desktop.ini raises PermissionError.
-            The real unfixed code calls shutil.copytree which internally uses
-            copy2; we simulate the PermissionError that occurs on the
-            hidden/system desktop.ini.
-            """
-            src_path = Path(src)
-            # Check if the source contains desktop.ini — if so, the real
-            # copytree would fail. We simulate this by raising PermissionError.
-            if (src_path / "desktop.ini").exists():
-                raise PermissionError(
-                    13, "Permission denied", str(src_path / "desktop.ini")
-                )
-            return original_copytree(src, dst, **kwargs)
-
-        # Track whether _write_theme_settings and _restart_explorer were called
+        # Track whether _write_theme_settings and restart_explorer were called
         theme_written = []
         explorer_restarted = []
 
-        def mock_write_theme(t):
+        def mock_write_theme(t, rpt):
             theme_written.append(t)
 
         def mock_restart_explorer():
@@ -153,14 +148,14 @@ class TestTaskbarDesktopIniBugCondition:
 
         # --- Run the restore under patches ---
         import modules.taskbar as taskbar_module
+        from modules import winutil
 
         with patch.object(taskbar_module, "TASKBAR_PINS_DIR", fake_pins_target):
-            with patch.object(taskbar_module.shutil, "copytree", side_effect=patched_copytree):
-                with patch.object(taskbar_module, "_write_theme_settings", side_effect=mock_write_theme):
-                    with patch.object(taskbar_module, "_restart_explorer", side_effect=mock_restart_explorer):
-                        # This should NOT raise — the restore should tolerate
-                        # the PermissionError and continue
-                        taskbar_module.restore(snapshot, snapshot_dir)
+            with patch.object(taskbar_module, "_write_theme_settings", side_effect=mock_write_theme):
+                with patch.object(winutil, "restart_explorer", side_effect=mock_restart_explorer):
+                    # This should NOT raise — the restore tolerates the
+                    # non-essential desktop.ini and continues.
+                    taskbar_module.restore(snapshot, snapshot_dir)
 
         # --- Assertions (Property 4 / Expected Behavior 2.4) ---
 
@@ -172,7 +167,12 @@ class TestTaskbarDesktopIniBugCondition:
             f"Expected: {expected_lnks}, Got: {restored_lnks}"
         )
 
-        # 2. Theme settings should have been written
+        # 2. desktop.ini must never be copied into the target
+        assert not (fake_pins_target / "desktop.ini").exists(), (
+            "desktop.ini should be skipped, never copied"
+        )
+
+        # 3. Theme settings should have been written
         assert len(theme_written) == 1, (
             f"_write_theme_settings should have been called once, "
             f"but was called {len(theme_written)} times"
@@ -181,8 +181,8 @@ class TestTaskbarDesktopIniBugCondition:
             f"Theme data mismatch. Expected: {theme}, Got: {theme_written[0]}"
         )
 
-        # 3. Explorer should have been restarted
+        # 4. Explorer should have been restarted
         assert len(explorer_restarted) == 1, (
-            f"_restart_explorer should have been called once, "
+            f"restart_explorer should have been called once, "
             f"but was called {len(explorer_restarted)} times"
         )
