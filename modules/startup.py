@@ -12,16 +12,24 @@ The .lnk shortcut files are bundled inside the snapshot zip under
 
 On restore:
   - Registry entries: written to HKCU. Entries whose binary doesn't exist on
-    the target system are skipped with a warning (so we don't pollute Run).
-  - Shortcuts: copied back to the user Startup folder. The shortcut's target
-    is checked first; missing targets are reported but the shortcut is still
-    placed (the user may install the app later).
+    the target system are skipped -- recorded as a skipped item that
+    includes the command path, never silently dropped (Req 2.4) -- so we
+    don't pollute Run with dangling commands.
+  - Shortcuts: copied back to the user Startup folder. Shortcuts missing
+    from the snapshot bundle are recorded as skipped; copy failures are
+    recorded as failed items.
+
+restore() returns a report.Report dict (matched/failed/skipped per item)
+instead of only printing. verify() re-reads the live Run/RunOnce values and
+the Startup folder's shortcut files and compares them against the snapshot.
 """
 
 import os
 import shutil
 import winreg
 from pathlib import Path
+
+from modules.report import Report
 
 
 _RUN_PATHS = [
@@ -111,37 +119,81 @@ def export(snapshot_dir: Path) -> dict:
     return data
 
 
-def restore(snapshot: dict, snapshot_dir: Path):
+def restore(snapshot: dict, snapshot_dir: Path) -> dict:
+    report = Report("startup", "restore")
+
     # 1. Registry entries -- skip ones whose binary is missing on this system
-    written = 0
-    skipped = 0
     for label, path in _RUN_PATHS:
         entries = (snapshot.get("registry") or {}).get(label, {})
         for name, command in entries.items():
+            item_name = f"{label}:{name}"
             if _binary_in_command_exists(command):
                 if _write_run_entry(path, name, command):
-                    written += 1
+                    report.add_matched(item_name, detail="written")
+                else:
+                    report.add_failed(item_name, detail="registry write failed")
             else:
-                print(f"[startup] Skipping {name!r} (binary not found): {command}")
-                skipped += 1
+                # Skipped entry must carry the command path (Req 2.4) so a
+                # dropped Run entry is never silently invisible.
+                report.add_skipped(item_name, detail=f"binary not found: {command}")
 
     # 2. Shortcuts
     bundle_dir = snapshot_dir / "startup_shortcuts"
     target_folder = _startup_folder()
     target_folder.mkdir(parents=True, exist_ok=True)
-    placed = 0
     for entry in snapshot.get("shortcuts", []) or []:
         name = entry.get("filename")
         if not name:
             continue
+        item_name = f"shortcut:{name}"
         src = bundle_dir / name
         if not src.exists():
+            report.add_skipped(item_name, detail="missing in snapshot bundle")
             continue
         try:
             shutil.copy2(src, target_folder / name)
-            placed += 1
+            report.add_matched(item_name, detail="placed in Startup folder")
         except OSError as e:
-            print(f"[startup] Could not place shortcut {name}: {e}")
+            report.add_failed(item_name, detail=f"could not place shortcut: {e}")
 
-    print(f"[startup] Restored {written} registry entries "
-          f"({skipped} skipped), {placed} shortcuts.")
+    result = report.finalize()
+    print(f"[startup] restore: {result['status']} "
+          f"({len(report.items)} item(s)).")
+    return result
+
+
+def verify(data: dict, snapshot_dir: Path) -> dict:
+    """Read-only: re-reads the live Run/RunOnce values and Startup folder
+    contents and compares them against the snapshot. Entries whose binary is
+    still missing on this system are reported skipped (never a false
+    mismatch), consistent with restore()'s own skip logic."""
+    report = Report("startup", "verify")
+
+    for label, path in _RUN_PATHS:
+        entries = (data.get("registry") or {}).get(label, {})
+        live = _read_run_entries(path)
+        for name, command in entries.items():
+            item_name = f"{label}:{name}"
+            if not _binary_in_command_exists(command):
+                report.add_skipped(item_name, detail=f"binary not found: {command}")
+                continue
+            actual = live.get(name)
+            if actual == command:
+                report.add_matched(item_name, expected=command, actual=actual)
+            else:
+                report.add_failed(item_name, detail="value mismatch",
+                                   expected=command, actual=actual)
+
+    target_folder = _startup_folder()
+    for entry in data.get("shortcuts", []) or []:
+        name = entry.get("filename")
+        if not name:
+            continue
+        item_name = f"shortcut:{name}"
+        if (target_folder / name).exists():
+            report.add_matched(item_name, detail="shortcut present")
+        else:
+            report.add_failed(item_name, detail="shortcut file missing on target",
+                               expected=name, actual=None)
+
+    return report.finalize()

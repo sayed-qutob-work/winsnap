@@ -9,10 +9,18 @@ Registry path:
 Each icon is identified by its CLSID. DWORD value:
     0 = visible
     1 = hidden
+
+restore() returns a report.Report dict with one item per CLSID and sets
+explorer_restart_required when any value was written. verify() re-reads the
+live CLSID DWORDs and compares them against the snapshot, treating an absent
+registry value as the Windows default (0 = visible), matching export()'s own
+default-fill behavior.
 """
 
 import winreg
 from pathlib import Path
+
+from modules.report import Report
 
 
 _PATH = r"Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel"
@@ -61,11 +69,42 @@ def export(snapshot_dir: Path) -> dict:
     return data
 
 
-def restore(snapshot: dict, snapshot_dir: Path):
-    written = 0
+def restore(snapshot: dict, snapshot_dir: Path) -> dict:
+    report = Report("desktop_icons", "restore")
     for friendly, clsid in _ICONS.items():
         if friendly in snapshot:
             if _write(clsid, snapshot[friendly]):
-                written += 1
-    print(f"[desktop_icons] Restored visibility for {written} desktop icons.")
-    print("[desktop_icons] Refresh desktop (F5) to see the change.")
+                report.add_matched(friendly, detail="written")
+            else:
+                report.add_failed(friendly, detail="registry write failed")
+        else:
+            report.add_skipped(friendly, detail="not present in snapshot")
+
+    if any(item["status"] == "matched" for item in report.items):
+        report.require_explorer_restart()
+
+    result = report.finalize()
+    print(f"[desktop_icons] restore: {result['status']} "
+          f"({len(report.items)} item(s)).")
+    return result
+
+
+def verify(data: dict, snapshot_dir: Path) -> dict:
+    """Read-only: re-reads the live CLSID DWORDs and compares them against
+    the snapshot. A missing registry value is treated as the 0 (visible)
+    default, matching export()'s own fill-in behavior."""
+    report = Report("desktop_icons", "verify")
+    for friendly, clsid in _ICONS.items():
+        if friendly not in data:
+            report.add_skipped(friendly, detail="not present in snapshot")
+            continue
+        expected = data[friendly]
+        actual = _read(clsid)
+        if actual is None:
+            actual = 0  # default when the value doesn't exist
+        if actual == expected:
+            report.add_matched(friendly, expected=expected, actual=actual)
+        else:
+            report.add_failed(friendly, detail="value mismatch",
+                               expected=expected, actual=actual)
+    return report.finalize()

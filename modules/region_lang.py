@@ -10,11 +10,18 @@ Sources:
 Layout codes are Windows hex KLIDs (e.g. "00000409" = en-US, "00000401" = ar-SA).
 The user must have the language pack installed on the target system for the
 layout to load -- we cannot install language packs from a script in v1.
+
+restore() returns a report.Report dict with one item per registry value
+(international settings, keyboard layout preloads, layout substitutes).
+verify() re-reads the international and Preload values live and compares
+them against the snapshot.
 """
 
 import ctypes
 import winreg
 from pathlib import Path
+
+from modules.report import Report
 
 
 _INTL_PATH = r"Control Panel\International"
@@ -97,33 +104,91 @@ def export(snapshot_dir: Path) -> dict:
     }
 
 
-def restore(snapshot: dict, snapshot_dir: Path):
+def restore(snapshot: dict, snapshot_dir: Path) -> dict:
+    report = Report("region_lang", "restore")
     intl    = snapshot.get("international") or {}
     layouts = snapshot.get("keyboard_layouts") or {}
     subs    = snapshot.get("layout_substitutes") or {}
 
-    written = 0
     for name, info in intl.items():
+        item_name = f"intl:{name}"
         if isinstance(info, dict) and "value" in info:
             if _write_value(_INTL_PATH, name, info["value"],
                             info.get("type", winreg.REG_SZ)):
-                written += 1
+                report.add_matched(item_name, detail="written")
+            else:
+                report.add_failed(item_name, detail="registry write failed")
+        else:
+            report.add_skipped(item_name, detail="malformed entry")
 
     for name, info in layouts.items():
+        item_name = f"layout:{name}"
         if isinstance(info, dict) and "value" in info:
             if _write_value(_LAYOUT_PRELOAD, name, info["value"],
                             info.get("type", winreg.REG_SZ)):
-                written += 1
+                report.add_matched(item_name, detail="written")
+            else:
+                report.add_failed(item_name, detail="registry write failed")
+        else:
+            report.add_skipped(item_name, detail="malformed entry")
 
     for name, info in subs.items():
+        item_name = f"substitute:{name}"
         if isinstance(info, dict) and "value" in info:
-            _write_value(_LAYOUT_SUBS, name, info["value"],
-                         info.get("type", winreg.REG_SZ))
+            if _write_value(_LAYOUT_SUBS, name, info["value"],
+                            info.get("type", winreg.REG_SZ)):
+                report.add_matched(item_name, detail="written")
+            else:
+                report.add_failed(item_name, detail="registry write failed")
+        else:
+            report.add_skipped(item_name, detail="malformed entry")
 
     # Notify Windows that the locale changed
     ctypes.windll.user32.SendMessageTimeoutW(
         0xFFFF, 0x001A, 0, "intl", 0x0002, 1000, None
     )
-    print(f"[region_lang] Restored {written} region/keyboard settings.")
     print("[region_lang] Note: keyboard layouts only load if the matching "
           "language pack is installed on this PC.")
+    result = report.finalize()
+    print(f"[region_lang] restore: {result['status']} "
+          f"({len(report.items)} item(s)).")
+    return result
+
+
+def verify(data: dict, snapshot_dir: Path) -> dict:
+    """Read-only: re-reads the international and keyboard-layout-preload
+    values live and compares them against the snapshot."""
+    report = Report("region_lang", "verify")
+    intl    = data.get("international") or {}
+    layouts = data.get("keyboard_layouts") or {}
+
+    if not intl and not layouts:
+        return report.skip_all("no region/language settings in snapshot")
+
+    for name, info in intl.items():
+        item_name = f"intl:{name}"
+        if not (isinstance(info, dict) and "value" in info):
+            report.add_skipped(item_name, detail="malformed entry")
+            continue
+        expected = info["value"]
+        actual, _actual_type = _read_str(_INTL_PATH, name)
+        if actual == expected:
+            report.add_matched(item_name, expected=expected, actual=actual)
+        else:
+            report.add_failed(item_name, detail="value mismatch",
+                               expected=expected, actual=actual)
+
+    for name, info in layouts.items():
+        item_name = f"layout:{name}"
+        if not (isinstance(info, dict) and "value" in info):
+            report.add_skipped(item_name, detail="malformed entry")
+            continue
+        expected = info["value"]
+        actual, _actual_type = _read_str(_LAYOUT_PRELOAD, name)
+        if actual == expected:
+            report.add_matched(item_name, expected=expected, actual=actual)
+        else:
+            report.add_failed(item_name, detail="value mismatch",
+                               expected=expected, actual=actual)
+
+    return report.finalize()

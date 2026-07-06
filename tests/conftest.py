@@ -5,7 +5,6 @@ Provides:
   - fake_winreg: record/replay registry reads and capture writes
   - fake_user32: capture SystemParametersInfoW / SendMessageTimeoutW / GetSystemMetrics calls
   - fake_subprocess: capture winget / taskkill / explorer invocations
-  - fake_desktop_wallpaper: mock IDesktopWallpaper COM object
   - snapshot_dir: temporary directory pre-populated as a snapshot folder
   - read_winget_export: helper to load winget_export.json from a snapshot dir
   - stage_snapshot_json / make_winsnap_zip / stage_v020_snapshot: build full
@@ -287,62 +286,6 @@ def fake_subprocess():
     Tests should patch `subprocess` in the target module with this.
     """
     return FakeSubprocess()
-
-
-# ---------------------------------------------------------------------------
-# IDesktopWallpaper COM mock
-# ---------------------------------------------------------------------------
-
-@dataclass
-class FakeDesktopWallpaper:
-    """
-    Mock for the IDesktopWallpaper COM interface.
-
-    Attributes:
-        monitor_count: number of monitors to report
-        set_wallpaper_calls: list of (monitor_id, path) tuples
-        monitor_ids: list of monitor device path strings
-    """
-    monitor_count: int = 1
-    set_wallpaper_calls: list = field(default_factory=list)
-    monitor_ids: list = field(default_factory=list)
-
-    def __post_init__(self):
-        if not self.monitor_ids:
-            self.monitor_ids = [
-                f"\\\\.\\DISPLAY{i+1}" for i in range(self.monitor_count)
-            ]
-
-    def GetMonitorDevicePathCount(self):
-        """Return the number of monitors."""
-        return self.monitor_count
-
-    def GetMonitorDevicePathAt(self, index):
-        """Return the monitor device path at the given index."""
-        if 0 <= index < len(self.monitor_ids):
-            return self.monitor_ids[index]
-        raise IndexError(f"Monitor index {index} out of range")
-
-    def SetWallpaper(self, monitor_id, path):
-        """Record a per-monitor wallpaper set call."""
-        self.set_wallpaper_calls.append((monitor_id, path))
-
-
-@pytest.fixture
-def fake_desktop_wallpaper():
-    """
-    Fixture providing a FakeDesktopWallpaper COM mock.
-
-    Configure monitor_count before use:
-        fake_desktop_wallpaper.monitor_count = 2
-        fake_desktop_wallpaper.__post_init__()  # regenerate monitor_ids
-    """
-    return FakeDesktopWallpaper()
-
-
-def make_fake_desktop_wallpaper(monitor_count: int) -> FakeDesktopWallpaper:
-    """Factory helper to create a FakeDesktopWallpaper with a specific monitor count."""
-    return FakeDesktopWallpaper(monitor_count=monitor_count)
 
 
 # ---------------------------------------------------------------------------

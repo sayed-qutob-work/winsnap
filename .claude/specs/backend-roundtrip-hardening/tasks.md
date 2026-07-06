@@ -17,7 +17,7 @@ File-conflict rules for parallel agents: only Task 3 and Task 6 edit `tests/conf
 
 ## Phase A — Foundations
 
-- [ ] 1. Create `modules/report.py` (Report builder + aggregation) with unit tests
+- [x] 1. Create `modules/report.py` (Report builder + aggregation) with unit tests
   - Create `modules/report.py` implementing the `Report` class exactly per design Components: `__init__(module, phase)`, `add(name, status, detail=None)`, sugar methods `add_matched`/`add_failed`/`add_skipped`, `require_explorer_restart()`, `skip_all(reason) -> dict`, `finalize() -> dict`; item dicts carry `name`, `status`, `detail`, and optional `expected`/`actual` (verify phase). `finalize()` applies the D1 aggregation rule (failed+matched → partial; failed only → failed; matched present, no failed → matched; skipped only → skipped; empty → skipped with builder reason).
   - Implement module-level pure functions `aggregate_status(items) -> str` and `worst_exit_code(reports) -> int` (0 iff no report has status `failed`).
   - Report dicts must be plain JSON-serializable dicts; restore-phase reports include `explorer_restart_required: bool`.
@@ -33,7 +33,7 @@ File-conflict rules for parallel agents: only Task 3 and Task 6 edit `tests/conf
   - Depends on: nothing. Parallel with Tasks 1, 3.
   - _Requirements: 2.5, 5.2, 6.1, 15.2, 15.3_  _Design: D2, D4, Components (winutil)_
 
-- [ ] 3. Extend test fixtures in `tests/conftest.py`
+- [x] 3. Extend test fixtures in `tests/conftest.py`
   - `FakeWinReg`: add constants `REG_BINARY = 3`, `REG_EXPAND_SZ = 2`; add `CreateKey(hive, path)` (no-op returning a `FakeRegistryKey`); add `EnumValue(key, i)` replaying from the existing `values` map filtered by `(key.hive, key.path)` (raise OSError past the end). Keep the `writes` tuple format `(hive, path, name, reserved, reg_type, value)` unchanged so existing tests keep passing. Mirror the new names in `_build_winreg_module`.
   - `FakeSubprocess`: add a `script(matcher, result)` convenience that composes into `run_side_effect` for scripting winget/powercfg command sequences (first matching matcher wins; default `FakeSubprocessResult(returncode=0)`).
   - Add new helpers: `stage_snapshot_json(dir, version, modules)`, `make_winsnap_zip(tmp_path, ..., member_names=None)` (supports injecting hostile member names for zip-slip tests), `stage_v020_snapshot(...)` producing a full 0.2.0-shape snapshot (flat env_vars map, taskbar without `pins`/`taskband`/accent fields, wallpaper without `style`/`tile`/`sha256`, mouse_display with `display`/`cursor_scheme`).
@@ -44,7 +44,7 @@ File-conflict rules for parallel agents: only Task 3 and Task 6 edit `tests/conf
 
 ## Phase B — Module hardening (all depend on Tasks 1–3; parallel with each other)
 
-- [ ] 4. Harden `modules/env_vars.py`: denylist, profile rewrite, PATH pre-passes, verify
+- [x] 4. Harden `modules/env_vars.py`: denylist, profile rewrite, PATH pre-passes, verify
   - Add `RESTORE_DENYLIST` frozenset and `_is_denylisted(name)` (denylist names plus `startswith("ONEDRIVE")`, case-insensitive) exactly per D5.
   - Add pure function `rewrite_profile_paths(value, source_profile, target_profile) -> tuple[str, bool]`: case-insensitive replacement of `source_profile` at path boundaries (followed by `\`, `;`, quote, or end-of-string) with `%USERPROFILE%`; no-op when source and target profiles match after `rstrip("\\")`/lower.
   - Change `export()` to return the 0.3.0 wrapped shape `{"source_profile": os.environ.get("USERPROFILE",""), "vars": {...}}`; change `restore()`/`verify()` to sniff the shape via the `"vars"` key, deriving `source_profile` from the captured `USERPROFILE` var for 0.2.0 snapshots (underivable → skip rewrite step, record skipped item).
@@ -53,15 +53,15 @@ File-conflict rules for parallel agents: only Task 3 and Task 6 edit `tests/conf
   - Create `tests/test_env_rewrite.py` per Testing Strategy: hypothesis properties for `rewrite_profile_paths` (idempotent, same-profile no-op, boundary-safe — `C:\Users\alice2` untouched when source is `C:\Users\alice`); denylist skip asserts `fake_winreg.writes` contains no write for each denylisted name and `OneDrive*` variants; REG_SZ→REG_EXPAND_SZ promotion; PATH merge preserves target entries and drops missing dirs as skipped items; 0.2.0 flat-shape restore works without KeyError.
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 14.2, 14.4, 15.1_  _Design: D5, Process 3_
 
-- [ ] 5. Harden `modules/apps.py` (per-package winget loop, export honesty) and `modules/checklist.py` (TTY guard, headless selection)
-- [ ] 5.1 Rewrite `apps.restore` as per-package install loop; fix export honesty
+- [x] 5. Harden `modules/apps.py` (per-package winget loop, export honesty) and `modules/checklist.py` (TTY guard, headless selection)
+- [x] 5.1 Rewrite `apps.restore` as per-package install loop; fix export honesty
   - `restore()`: first `shutil.which("winget")` — absent → `report.skip_all("winget not found on target")` (manual list still printed), no exception (Req 3.1). Then per package in `data["winget"]`: run `winget install --id <PackageIdentifier> --exact --accept-package-agreements --accept-source-agreements --disable-interactivity` with `capture_output=True, text=True` and **no `timeout` kwarg** (Req 3.2). Classify per the D3 table using named module constants `WINGET_ALREADY_INSTALLED = -1978335135` and `WINGET_NO_PACKAGE_FOUND = -1978335212` with stdout-substring fallbacks ("already installed", "No package found"): rc 0 → matched "installed"; already-installed → matched; unavailable → skipped "unavailable"; else failed with returncode + stderr tail. Always continue to the next package (Req 3.4). Manual apps → skipped items `"manual install required, url=…"`. Return `report.finalize()`. Delete the `winget import` batch call and its `timeout=600`.
   - `_export_winget`: return `(packages, error_msg | None)` with `timeout=120`; on TimeoutExpired/FileNotFoundError/nonzero exit/JSONDecodeError set an explicit error message and print a WARNING; `export()` stores `"winget_export_error": None | "<msg>"` in its result (Req 3.5).
   - `_write_filtered_winget_export`: replace the hardcoded `"CreationDate": "2024-01-01..."` with `datetime.now().astimezone().isoformat()` (Req 3.6).
   - Add `apps.verify(data, snapshot_dir)`: winget absent → skipped; per package `winget list --id <id> --exact --disable-interactivity` (rc 0 → matched, else failed); manual apps → skipped "not verifiable programmatically".
   - Create `tests/test_apps_winget.py`: presence-check skip; classification table via `FakeSubprocess.script`; assert no `timeout` kwarg is passed to any `winget install` `subprocess.run` call; continue-past-unavailable; export error surfaced in result + never a silent `[]`; `CreationDate` parseable and ≈ now; verify classification.
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 7.1_  _Design: D3, Process 2_
-- [ ] 5.2 Headless selection plumbing in `apps.export` and TTY guard in `checklist.run`
+- [x] 5.2 Headless selection plumbing in `apps.export` and TTY guard in `checklist.run`
   - Extend `apps.export` signature to `export(snapshot_dir, show_all=False, selection="interactive", selection_file=None)`: `"all"` selects every discovered winget + manual app without importing checklist; `"file"` loads `{"winget": [...], "manual": [...]}` from `selection_file`, matches ids/names against discovered lists, and records unmatched entries as a warnings list in the export result; `"interactive"` keeps the exact current sequence `from modules import checklist; checklist.run(winget_apps, manual_only)` (attribute lookup at call time so the GUI monkey-patch at gui.py:1228 keeps working; `gui.py` is NOT modified).
   - Add the TTY guard at the top of `modules/checklist.py:run` (before any `msvcrt` use): `if not sys.stdin.isatty(): raise RuntimeError("Interactive app selection requires a terminal. Use --all-apps or --apps-from FILE for headless export.")`.
   - Create `tests/test_headless_export.py` (module-level tests only; Task 13 appends CLI-level tests): `selection="all"`/`"file"` never touch checklist (monkeypatch `modules.checklist.run` to raise if called); interactive default still calls `checklist.run`; `checklist.run` raises off-TTY (patch `sys.stdin.isatty` → False); a replaced `checklist.run` (GUI simulation) bypasses the guard entirely.
@@ -77,7 +77,7 @@ File-conflict rules for parallel agents: only Task 3 and Task 6 edit `tests/conf
   - Remove `FakeDesktopWallpaper`, `fake_desktop_wallpaper`, and `make_fake_desktop_wallpaper` from `tests/conftest.py` in this same task (their only consumer is the test rewritten above). Depends on Task 3 (conftest edits are sequential).
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 14.2, 15.3_  _Design: D4_
 
-- [ ] 7. Harden `modules/power.py`: admin gate, corrected import flow, verify
+- [x] 7. Harden `modules/power.py`: admin gate, corrected import flow, verify
   - `restore()`: first check `winutil.is_admin()` — not admin → return `report.skip_all("requires elevation — run restore.py as Administrator")` before any powercfg call (Req 6.1). Then implement exactly the design flow: `powercfg /import <file> <original_guid>` (capture stdout+stderr); rc 0 → activate original GUID; else if original GUID appears in `powercfg /list` output → treat as already-present, activate it with item "plan already present, activating existing" (Req 6.3); else retry `powercfg /import <file>` without GUID and parse the assigned GUID from the **successful** output; all imports failed → failed report containing both commands' stdout/stderr (Req 6.4). Finish with `powercfg /setactive <target_guid>` (nonzero → failed item with output). **Delete** the existing parse-GUID-from-failed-import branch in `restore()` (power.py:104–111).
   - Rewire `export()`/`restore()` to use `winutil.is_admin` and remove the local `_is_admin` (or keep it as a one-line delegate).
   - Add `verify(data, snapshot_dir)` (read-only): non-elevated → skipped (per Req 6.5 / design D6, "skipped (non-elevated)" is an explicit verify outcome); else run `powercfg /getactivescheme` and compare its GUID-or-name against the snapshot's intended plan (`data["guid"]`/`data["name"]`) → matched/failed.

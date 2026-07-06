@@ -214,7 +214,24 @@ def run(winget_list: list, manual_list: list):
     """
     Shows the interactive checklist.
     Returns (selected_winget, selected_manual) or None if cancelled.
+
+    Raises RuntimeError immediately, before touching msvcrt, if stdin is not
+    a real terminal (Req 8.5). A headless export (CI, scheduled task, remote
+    session with no TTY) would otherwise hang forever on msvcrt.getch(); this
+    guard turns that hang into a clear, immediate failure that export.py's
+    per-module try/except records as the apps module's error.
+
+    This guard lives here rather than in apps.py so that a caller who
+    replaces `checklist.run` entirely (the GUI monkey-patches
+    `modules.checklist.run` at gui.py:1228-1230) never hits it — the GUI
+    runs without a console and must not be affected by this check.
     """
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Interactive app selection requires a terminal. "
+            "Use --all-apps or --apps-from FILE for headless export."
+        )
+
     _enable_ansi()
     entries = build_entries(winget_list, manual_list)
 
