@@ -120,7 +120,7 @@ File-conflict rules for parallel agents: only Task 3 and Task 6 edit `tests/conf
 
 ## Phase C — CLI orchestration (requires all of Phase B)
 
-- [ ] 12. Rewrite `restore.py` orchestration: safe extraction, ordering, verify, reporting, exit codes
+- [x] 12. Rewrite `restore.py` orchestration: safe extraction, ordering, verify, reporting, exit codes
   - Add `class ZipSlipError(Exception)` (carries `members: list[str]`) and `class SnapshotLayoutError(Exception)`; implement `safe_extract(zf, dest)` per D9 (collect every member whose resolved path escapes `dest` via `is_relative_to`; any → raise listing all offenders; else `extractall`) and `find_snapshot_dir(tmp_dir)` (`tmp_dir/snapshot.json` first, then each immediate subdirectory; none → raise). Replace `zf.extractall(tmp_dir)` and the `extracted_dirs[0]` pick in `main()`; ZipSlipError → print rejected members, exit 1; SnapshotLayoutError → clear error, cleanup, exit 1 (Req 13.1, 13.2, 13.4).
   - Rebuild `ALL_MODULES` from the manifest: `[(name, importlib.import_module(f"modules.{name}")) for name in manifest.MODULE_NAMES]`, replacing the hand-written list — keep the public name and `(key, module)` tuple shape for gui.py:1470 (Req 2.1, 2.5, 15.6).
   - Implement `run_modules(modules_to_run, modules_data, snapshot_dir, *, dry_run)` → `{name: restore_report}`: sets `taskbar.INLINE_EXPLORER_RESTART = False` (restored in a `finally`); catches per-module exceptions into synthesized `{"status": "failed", "items": [], "reason": str(exc)}`; a module returning `None` → `skipped: "module returned no report"` (never success). After the loop, if any report has `explorer_restart_required`, call `winutil.restart_explorer()` exactly once — after all restores, before verification (Req 1.3, 2.2).
