@@ -161,7 +161,7 @@ File-conflict rules for parallel agents: only Task 3 and Task 6 edit `tests/conf
 
 ## Phase E — Regression gate (sequential, last)
 
-- [ ] 17. Full-suite regression run and cleanup sweep
+- [x] 17. Full-suite regression run and cleanup sweep
   - Run `python -m pytest tests/ -q` from the project root; fix any remaining failures — including the GUI-side tests (`test_export_worker.py`, `test_restore_worker.py`, `test_pre_start_guards.py`, etc.) that exercise `restore.ALL_MODULES`, `export.SNAPSHOT_FORMAT_VERSION`, `_build_modules`, or module `restore()` return values — without modifying `gui.py` (Req 15.4, 15.6).
   - Sweep for leftovers: no `comtypes` references anywhere (Req 15.3); no module docstring claims DPI restore (Req 11.4); grep confirms all registry writes are HKCU-only (powercfg excepted) (Req 15.2); `modules.checklist.run` is still a plain module attribute (patchable) (Req 8.4).
   - Contract sweep (code/grep assertions, not manual QA): confirm `git diff --stat gui.py` is empty — `gui.py` has zero diff (explicit scope constraint, Req 15.6); grep-verify no module signature drifted from `export(snapshot_dir) -> dict` / `restore(data, snapshot_dir) -> dict` / `verify(data, snapshot_dir) -> dict` (apps' keyword-only additions excepted) (Req 15.1).
