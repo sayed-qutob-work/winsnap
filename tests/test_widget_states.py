@@ -134,6 +134,32 @@ class TestRestoreViewDefaults:
         assert config.dry_run is False
         assert config.selected_modules == set(manifest.MODULE_NAMES)
 
+    def test_verify_unchecked_by_default(self):
+        """Verify after restore checkbox should be unchecked by default (Req 3.1)."""
+        view = RestoreView()
+        assert not view._verify_cb.isChecked()
+        assert view.build_config().verify is False
+
+    def test_dry_run_disables_and_unchecks_verify(self):
+        """Checking Dry run disables and unchecks Verify (Req 3.5)."""
+        view = RestoreView()
+        view._verify_cb.setChecked(True)
+        view._dry_run_cb.setChecked(True)
+        assert view._verify_cb.isChecked() is False
+        assert view._verify_cb.isEnabled() is False
+
+        # Unchecking Dry run re-enables Verify without forcing it back on.
+        view._dry_run_cb.setChecked(False)
+        assert view._verify_cb.isEnabled() is True
+        assert view._verify_cb.isChecked() is False
+
+    def test_build_config_reflects_verify_checkbox(self):
+        """build_config() should read the Verify checkbox state into RestoreConfig.verify."""
+        view = RestoreView()
+        view._verify_cb.setChecked(True)
+        config = view.build_config()
+        assert config.verify is True
+
 
 # ---------------------------------------------------------------------------
 # AppSelectorDialog tests

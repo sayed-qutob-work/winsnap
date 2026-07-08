@@ -590,11 +590,14 @@ class RestoreView(QWidget):
     - Snapshot file selection (Browse button + path label, filter *.winsnap)
     - Module selection (ModuleSelector instance)
     - Dry_Run checkbox (default unchecked)
+    - Verify after restore checkbox (default unchecked; disabled and
+      unchecked while Dry run is checked, matching the CLI's
+      dry-run-bypasses-verify semantics)
 
     The ``build_config()`` method assembles the current widget state into a
     ``RestoreConfig`` for use by the restore worker.
 
-    Requirements: 8.1, 8.5, 8.6, 8.7, 9.1, 9.2, 9.4, 9.5
+    Requirements: 3.1, 3.5, 8.1, 8.5, 8.6, 8.7, 9.1, 9.2, 9.4, 9.5
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -628,6 +631,22 @@ class RestoreView(QWidget):
         self._dry_run_cb.setChecked(False)
         layout.addWidget(self._dry_run_cb)
 
+        # --- Verify after restore checkbox ---
+        self._verify_cb = QCheckBox("Verify after restore", self)
+        self._verify_cb.setChecked(False)
+        layout.addWidget(self._verify_cb)
+
+        # Dry run bypasses verify, matching the CLI's dry-run-bypasses-verify
+        # semantics: checking "Dry run" disables and unchecks "Verify";
+        # unchecking "Dry run" re-enables "Verify" without forcing it back on.
+        self._dry_run_cb.toggled.connect(self._on_dry_run_toggled)
+
+    def _on_dry_run_toggled(self, checked: bool) -> None:
+        """Disable and uncheck Verify while Dry run is checked (Req 3.5)."""
+        if checked:
+            self._verify_cb.setChecked(False)
+        self._verify_cb.setEnabled(not checked)
+
     def _choose_snapshot(self) -> None:
         """Open a file chooser for *.winsnap files. If cancelled, path stays unchanged (Req 8.7)."""
         chosen, _ = QFileDialog.getOpenFileName(
@@ -646,6 +665,7 @@ class RestoreView(QWidget):
             snapshot_path=self._snapshot_path if self._snapshot_path is not None else Path(""),
             dry_run=self._dry_run_cb.isChecked(),
             selected_modules=self._module_selector.selected(),
+            verify=self._verify_cb.isChecked(),
         )
 
 

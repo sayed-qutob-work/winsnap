@@ -100,7 +100,7 @@
   - Depends on Task 3 (consumes the reshaped data models and `manifest.MODULE_NAMES`).
   - _Requirements: 3.1, 3.5, 5.1, 5.3, 8.1, 8.2, 8.3, 8.4, 8.6_
 
-- [ ] 4.1 Build `ModuleSelector` from `manifest.MODULE_NAMES`
+- [x] 4.1 Build `ModuleSelector` from `manifest.MODULE_NAMES`
   - Change `ModuleSelector` construction to derive its checkbox list from `manifest.MODULE_NAMES` instead of the removed `MODULES_EXPORT_ORDER`; use the same instance/shape for both `ExportView` and `RestoreView`.
   - Update `tests/test_widget_states.py` references from `MODULES_EXPORT_ORDER` to `manifest.MODULE_NAMES`.
   - _Requirements: 5.1, 5.3_
