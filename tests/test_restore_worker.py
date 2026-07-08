@@ -8,7 +8,34 @@ Tests the RestoreWorker end-to-end behavior with real .winsnap archives
 - Module skip conditions (absent, export-errored, deselected)
 - Successful restore calls module restore functions
 
-Validates: Requirements 9.6, 9.7, 10.2, 14.6
+Rewritten for gui-backend-alignment Task 7.6: ``RestoreWorker._do_restore()``
+is now a thin adapter over restore.py's importable orchestration functions
+(``safe_extract``, ``find_snapshot_dir``, ``evaluate_snapshot_version``,
+``partition_modules``, ``run_dry_run``, ``run_modules``, ``run_verify``)
+instead of a hand-rolled per-module loop. The OLD approach here swapped the
+entire ``restore`` module for a bare ``MagicMock()`` via
+``patch.dict("sys.modules", {"restore": MagicMock()})`` and then set a
+handful of attributes (``SUPPORTED_MAJOR``, ``ALL_MODULES``, ``_summarize``)
+on it. That silently replaced every orchestration function above with an
+auto-generated MagicMock too (since they were never explicitly re-attached),
+so ``safe_extract``/``find_snapshot_dir``/``run_dry_run``/``run_modules``
+stopped doing any real extraction, snapshot-dir discovery, or module
+dispatch -- which is why these tests broke when Task 5.2 rewired
+``_do_restore()`` onto the new call surface.
+
+The fix: import the REAL ``restore`` module and only monkeypatch
+``restore.ALL_MODULES`` (plus ``modules.manifest.MODULE_NAMES``, so the
+worker's manifest-derived "deselected" loop agrees with the same stub
+module universe) to install stub modules -- exactly the pattern
+tests/test_restore_worker_adapters.py (Task 5.3) already uses. Every real
+orchestration function (safe_extract, find_snapshot_dir,
+evaluate_snapshot_version, partition_modules, run_dry_run, run_modules,
+run_verify) then runs for real against the stub modules and a real
+on-disk .winsnap archive, so these tests exercise the worker's actual wiring
+to the backend rather than a fully-mocked stand-in for it.
+
+Validates: Requirements 2.1, 2.2, 2.3, 4.1, 4.3, 11.6 (dry-run/skip/failure
+scenarios below also exercise 1.1, 1.6, 5.1, 5.2, 7.1, 7.2).
 """
 
 import json
@@ -16,7 +43,7 @@ import os
 import sys
 import zipfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -26,6 +53,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
+
+import restore as restore_module
+from modules import manifest as manifest_module
 
 from gui import (
     ModuleOutcome,
@@ -78,6 +108,23 @@ def _create_winsnap_archive(tmp_path: Path, snapshot_data: dict) -> Path:
     return archive_path
 
 
+def _install_stub_modules(monkeypatch, stub_map: dict) -> None:
+    """Install `stub_map` ({key: module}) as both restore.ALL_MODULES and
+    modules.manifest.MODULE_NAMES (same keys, same order) on the REAL
+    restore module.
+
+    This is the new monkeypatch target for module substitution (Req 2.1,
+    5.1, 5.2), replacing the old whole-module
+    ``patch.dict(sys.modules, {"restore": MagicMock()})`` swap, which also
+    clobbered safe_extract/find_snapshot_dir/evaluate_snapshot_version/
+    partition_modules/run_dry_run/run_modules/run_verify. Mirrors
+    tests/test_restore_worker_adapters.py's helper of the same name.
+    """
+    items = list(stub_map.items())
+    monkeypatch.setattr(restore_module, "ALL_MODULES", items)
+    monkeypatch.setattr(manifest_module, "MODULE_NAMES", [k for k, _ in items])
+
+
 class SignalCollector:
     """Collects signals emitted by RestoreWorker for assertion."""
 
@@ -124,7 +171,10 @@ class SignalCollector:
 class TestDryRunAppliesNoChanges:
     """Dry-run mode should emit log messages but never call module.restore.
 
-    Validates: Requirements 9.6, 9.7
+    The worker's dry-run path now delegates to ``restore.run_dry_run``
+    (Req 8.8), which in turn uses the real ``restore._summarize`` -- these
+    tests no longer monkeypatch ``_summarize`` and instead assert against
+    its real (un-mocked) output text.
     """
 
     def test_dry_run_does_not_call_module_restore(self, tmp_path, qapp, monkeypatch):
@@ -150,41 +200,40 @@ class TestDryRunAppliesNoChanges:
         worker = RestoreWorker(config)
         collector = SignalCollector(worker)
 
-        # Mock the restore module's ALL_MODULES to track calls
+        # Mock ALL_MODULES to track calls; monkeypatch target moved from the
+        # whole `restore` module to just ALL_MODULES/MODULE_NAMES.
         mock_wallpaper = MagicMock()
         mock_env_vars = MagicMock()
+        _install_stub_modules(monkeypatch, {
+            "env_vars": mock_env_vars,
+            "wallpaper": mock_wallpaper,
+        })
 
-        fake_all_modules = [
-            ("env_vars", mock_env_vars),
-            ("wallpaper", mock_wallpaper),
-        ]
-
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(_restore, "_summarize", lambda key, data: f"would restore {key}")
-
-            worker.run()
+        worker.run()
 
         # Module restore functions should NOT have been called
         mock_wallpaper.restore.assert_not_called()
         mock_env_vars.restore.assert_not_called()
 
         # Should have emitted log messages about what would be restored
+        # (real restore._summarize output, e.g. "would restore N field(s)"
+        # for wallpaper and "would restore N environment variable(s)" for
+        # env_vars).
         assert any("would restore" in msg for msg in collector.log_messages), \
             "Dry-run should emit summary log messages"
 
-        # All processed modules should be PASSED (dry-run counts as success)
-        passed_outcomes = [o for o in collector.outcomes if o.status == ModuleStatus.PASSED]
-        assert len(passed_outcomes) == 2, \
-            "Both selected modules should be PASSED in dry-run"
+        # All processed modules should be MATCHED (dry-run counts as success;
+        # ModuleStatus.PASSED was renamed to ModuleStatus.MATCHED as part of
+        # the report-based status vocabulary, Req 1.5).
+        matched_outcomes = [o for o in collector.outcomes if o.status == ModuleStatus.MATCHED]
+        assert len(matched_outcomes) == 2, \
+            "Both selected modules should be MATCHED in dry-run"
 
         # finished signal should have been emitted
         assert len(collector.summaries) == 1
 
     def test_dry_run_emits_per_module_summary_text(self, tmp_path, qapp, monkeypatch):
-        """Dry-run emits _summarize text for each selected module."""
+        """Dry-run emits real _summarize text for each selected module."""
         snapshot_data = {
             "exported_at": "2024-01-01T12:00:00",
             "winsnap_version": "0.2.0",
@@ -206,20 +255,13 @@ class TestDryRunAppliesNoChanges:
         collector = SignalCollector(worker)
 
         mock_cursors = MagicMock()
-        fake_all_modules = [("cursors", mock_cursors)]
+        _install_stub_modules(monkeypatch, {"cursors": mock_cursors})
 
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(
-                _restore, "_summarize",
-                lambda key, data: f"would set cursor scheme {data.get('scheme')!r}"
-            )
+        worker.run()
 
-            worker.run()
-
-        # Should have a log message with the cursor scheme info
+        # restore._summarize special-cases "cursors" as
+        # f"would set cursor scheme {data.get('scheme')!r}" -- assert
+        # against that real text rather than a monkeypatched stand-in.
         assert any("cursor scheme" in msg for msg in collector.log_messages), \
             "Dry-run should emit _summarize text for cursors module"
 
@@ -231,9 +273,13 @@ class TestDryRunAppliesNoChanges:
 # ---------------------------------------------------------------------------
 
 class TestIncompatibleVersionHalts:
-    """Snapshot with incompatible format_version should halt before any module runs.
+    """Snapshot with incompatible format_version should halt before any
+    module runs.
 
-    Validates: Requirements 10.2
+    Version acceptance is now decided by the real
+    ``restore.evaluate_snapshot_version`` (Req 7.1, 7.2); since
+    ``restore.SUPPORTED_MAJOR`` is already 0 by default, these tests no
+    longer need to monkeypatch it.
     """
 
     def test_incompatible_version_emits_error_and_halts(self, tmp_path, qapp, monkeypatch):
@@ -261,18 +307,12 @@ class TestIncompatibleVersionHalts:
 
         mock_wallpaper = MagicMock()
         mock_env_vars = MagicMock()
-        fake_all_modules = [
-            ("env_vars", mock_env_vars),
-            ("wallpaper", mock_wallpaper),
-        ]
+        _install_stub_modules(monkeypatch, {
+            "env_vars": mock_env_vars,
+            "wallpaper": mock_wallpaper,
+        })
 
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(_restore, "_summarize", lambda key, data: "")
-
-            worker.run()
+        worker.run()
 
         # No module restore should have been called
         mock_wallpaper.restore.assert_not_called()
@@ -284,7 +324,8 @@ class TestIncompatibleVersionHalts:
         assert any("99.0.0" in msg or "newer" in msg for msg in collector.error_logs), \
             "Error log should mention the incompatible version"
 
-        # No module outcomes should have been emitted (halted before modules)
+        # No module outcomes should have been emitted (halted before
+        # resolving the run set / manifest deselected-loop)
         assert len(collector.outcomes) == 0, \
             "No module outcomes should be emitted when halted due to version"
 
@@ -314,15 +355,9 @@ class TestIncompatibleVersionHalts:
         collector = SignalCollector(worker)
 
         mock_power = MagicMock()
-        fake_all_modules = [("power", mock_power)]
+        _install_stub_modules(monkeypatch, {"power": mock_power})
 
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(_restore, "_summarize", lambda key, data: "")
-
-            worker.run()
+        worker.run()
 
         mock_power.restore.assert_not_called()
 
@@ -339,7 +374,9 @@ class TestIncompatibleVersionHalts:
 class TestModuleSkipConditions:
     """Modules should be skipped with correct reasons for various conditions.
 
-    Validates: Requirements 14.6
+    Skip reasons and wording now come from ``restore.partition_modules`` +
+    ``gui.skip_outcome`` (Req 2.2), not an inline loop -- assertions below
+    use the current wording those functions actually produce.
     """
 
     def test_deselected_module_is_skipped(self, tmp_path, qapp, monkeypatch):
@@ -368,18 +405,16 @@ class TestModuleSkipConditions:
 
         mock_wallpaper = MagicMock()
         mock_env_vars = MagicMock()
-        fake_all_modules = [
-            ("env_vars", mock_env_vars),
-            ("wallpaper", mock_wallpaper),
-        ]
+        # env_vars is selected+present, so run_modules will really call its
+        # restore(); give it a valid report dict so report_to_outcome has a
+        # real status to classify (dry_run=False → the real restore path).
+        mock_env_vars.restore.return_value = {"status": "matched", "items": []}
+        _install_stub_modules(monkeypatch, {
+            "env_vars": mock_env_vars,
+            "wallpaper": mock_wallpaper,
+        })
 
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(_restore, "_summarize", lambda key, data: "")
-
-            worker.run()
+        worker.run()
 
         # wallpaper should be SKIPPED with "Deselected by user"
         wallpaper_outcomes = [o for o in collector.outcomes if o.name == "wallpaper"]
@@ -391,7 +426,7 @@ class TestModuleSkipConditions:
         mock_wallpaper.restore.assert_not_called()
 
     def test_absent_module_is_skipped(self, tmp_path, qapp, monkeypatch):
-        """Module absent from snapshot → SKIPPED 'Not present in snapshot'."""
+        """Module absent from snapshot → SKIPPED 'Not found in snapshot'."""
         # Snapshot only has wallpaper, not cursors
         snapshot_data = {
             "exported_at": "2024-01-01T12:00:00",
@@ -415,25 +450,24 @@ class TestModuleSkipConditions:
         collector = SignalCollector(worker)
 
         mock_wallpaper = MagicMock()
+        # wallpaper is selected+present, so it really runs; give it a valid
+        # report dict.
+        mock_wallpaper.restore.return_value = {"status": "matched", "items": []}
         mock_cursors = MagicMock()
-        fake_all_modules = [
-            ("wallpaper", mock_wallpaper),
-            ("cursors", mock_cursors),
-        ]
+        _install_stub_modules(monkeypatch, {
+            "wallpaper": mock_wallpaper,
+            "cursors": mock_cursors,
+        })
 
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(_restore, "_summarize", lambda key, data: "")
+        worker.run()
 
-            worker.run()
-
-        # cursors should be SKIPPED with "Not present in snapshot"
+        # cursors should be SKIPPED with "Not found in snapshot" (the
+        # wording restore.partition_modules'/gui.skip_outcome's
+        # "not_found_in_snapshot" reason code maps to)
         cursors_outcomes = [o for o in collector.outcomes if o.name == "cursors"]
         assert len(cursors_outcomes) == 1
         assert cursors_outcomes[0].status == ModuleStatus.SKIPPED
-        assert cursors_outcomes[0].detail == "Not present in snapshot"
+        assert cursors_outcomes[0].detail == "Not found in snapshot"
 
         # cursors.restore should NOT have been called
         mock_cursors.restore.assert_not_called()
@@ -463,18 +497,15 @@ class TestModuleSkipConditions:
 
         mock_power = MagicMock()
         mock_wallpaper = MagicMock()
-        fake_all_modules = [
-            ("wallpaper", mock_wallpaper),
-            ("power", mock_power),
-        ]
+        # wallpaper is selected+present (no export error), so it really
+        # runs; give it a valid report dict.
+        mock_wallpaper.restore.return_value = {"status": "matched", "items": []}
+        _install_stub_modules(monkeypatch, {
+            "wallpaper": mock_wallpaper,
+            "power": mock_power,
+        })
 
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(_restore, "_summarize", lambda key, data: "")
-
-            worker.run()
+        worker.run()
 
         # power should be SKIPPED with "Was not captured (export error)"
         power_outcomes = [o for o in collector.outcomes if o.name == "power"]
@@ -491,9 +522,10 @@ class TestModuleSkipConditions:
 # ---------------------------------------------------------------------------
 
 class TestSuccessfulRestore:
-    """Modules that are present and selected should have their restore called.
-
-    Validates: Requirements 9.6, 14.6
+    """Modules that are present and selected should have their restore
+    called, with the outcome classified from the returned report dict's
+    ``status`` field (Req 1.1) via ``restore.run_modules`` (Req 2.1) -- not
+    from whether the call raised.
     """
 
     def test_selected_present_module_restore_is_called(self, tmp_path, qapp, monkeypatch):
@@ -519,26 +551,28 @@ class TestSuccessfulRestore:
         collector = SignalCollector(worker)
 
         mock_wallpaper = MagicMock()
-        fake_all_modules = [("wallpaper", mock_wallpaper)]
+        # restore.run_modules expects a report dict back from restore();
+        # a bare MagicMock() return value is not a valid report shape.
+        mock_wallpaper.restore.return_value = {"status": "matched", "items": []}
+        _install_stub_modules(monkeypatch, {"wallpaper": mock_wallpaper})
 
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(_restore, "_summarize", lambda key, data: "")
-
-            worker.run()
+        worker.run()
 
         # wallpaper.restore should have been called
         mock_wallpaper.restore.assert_called_once()
 
-        # The outcome should be PASSED
+        # The outcome should be MATCHED (renamed from PASSED, Req 1.5)
         wallpaper_outcomes = [o for o in collector.outcomes if o.name == "wallpaper"]
         assert len(wallpaper_outcomes) == 1
-        assert wallpaper_outcomes[0].status == ModuleStatus.PASSED
+        assert wallpaper_outcomes[0].status == ModuleStatus.MATCHED
 
     def test_module_raising_exception_is_failed(self, tmp_path, qapp, monkeypatch):
-        """A module that raises during restore is classified as FAILED."""
+        """A module that raises during restore is classified as FAILED.
+
+        restore.run_modules catches the exception and synthesizes a
+        ``{"status": "failed", "reason": str(e)}`` report rather than
+        letting it propagate (Req 1.6), and the run continues.
+        """
         snapshot_data = {
             "exported_at": "2024-01-01T12:00:00",
             "winsnap_version": "0.2.0",
@@ -561,20 +595,15 @@ class TestSuccessfulRestore:
 
         mock_wallpaper = MagicMock()
         mock_wallpaper.restore.side_effect = RuntimeError("Simulated failure")
-        fake_all_modules = [("wallpaper", mock_wallpaper)]
+        _install_stub_modules(monkeypatch, {"wallpaper": mock_wallpaper})
 
-        with patch.dict("sys.modules", {"restore": MagicMock()}):
-            import restore as _restore
-            monkeypatch.setattr(_restore, "SUPPORTED_MAJOR", 0)
-            monkeypatch.setattr(_restore, "ALL_MODULES", fake_all_modules)
-            monkeypatch.setattr(_restore, "_summarize", lambda key, data: "")
-
-            worker.run()
+        worker.run()
 
         # wallpaper.restore was called but raised
         mock_wallpaper.restore.assert_called_once()
 
-        # The outcome should be FAILED with the exception text
+        # The outcome should be FAILED with the exception text as the
+        # synthesized report's "reason"
         wallpaper_outcomes = [o for o in collector.outcomes if o.name == "wallpaper"]
         assert len(wallpaper_outcomes) == 1
         assert wallpaper_outcomes[0].status == ModuleStatus.FAILED

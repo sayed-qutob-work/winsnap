@@ -53,26 +53,26 @@ def export_scenario():
             st.fixed_dictionaries({"error": st.text(min_size=0, max_size=100)}),
         ).map(lambda t: {"name": t[0], "raised": t[1], "result": t[2], "expected_status": ModuleStatus.FAILED}),
 
-        # Scenario: result is empty dict → PASSED
+        # Scenario: result is empty dict → MATCHED
         st.tuples(
             module_names,
             st.none(),
             st.just({}),
-        ).map(lambda t: {"name": t[0], "raised": t[1], "result": t[2], "expected_status": ModuleStatus.PASSED}),
+        ).map(lambda t: {"name": t[0], "raised": t[1], "result": t[2], "expected_status": ModuleStatus.MATCHED}),
 
-        # Scenario: result has {"enabled": False} (no error/skip) → PASSED
+        # Scenario: result has {"enabled": False} (no error/skip) → MATCHED
         st.tuples(
             module_names,
             st.none(),
             st.fixed_dictionaries({"enabled": st.just(False)}),
-        ).map(lambda t: {"name": t[0], "raised": t[1], "result": t[2], "expected_status": ModuleStatus.PASSED}),
+        ).map(lambda t: {"name": t[0], "raised": t[1], "result": t[2], "expected_status": ModuleStatus.MATCHED}),
 
-        # Scenario: result is None (no raise) → PASSED
+        # Scenario: result is None (no raise) → MATCHED
         st.tuples(
             module_names,
             st.none(),
             st.none(),
-        ).map(lambda t: {"name": t[0], "raised": t[1], "result": t[2], "expected_status": ModuleStatus.PASSED}),
+        ).map(lambda t: {"name": t[0], "raised": t[1], "result": t[2], "expected_status": ModuleStatus.MATCHED}),
     )
 
 
@@ -85,7 +85,7 @@ def test_export_outcome_classification(scenario):
     classify_export_outcome SHALL classify the module as FAILED when the module
     raised, when the result carries an "error" key, or when the result carries
     a skip_reason (with the "not_admin" case yielding a detail that states
-    Administrator privileges are required); SHALL classify it as PASSED when it
+    Administrator privileges are required); SHALL classify it as MATCHED when it
     completed without raising and without an error/skip indicator.
 
     **Validates: Requirements 6.2, 7.3, 14.4, 14.5**
@@ -119,6 +119,6 @@ def test_export_outcome_classification(scenario):
     elif result is not None and "error" in result:
         # Error key → detail is the error message
         assert outcome.detail == str(result["error"])
-    elif expected_status == ModuleStatus.PASSED:
-        # PASSED → no detail
+    elif expected_status == ModuleStatus.MATCHED:
+        # MATCHED → no detail
         assert outcome.detail is None

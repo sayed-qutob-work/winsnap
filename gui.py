@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -856,19 +857,38 @@ class AppSelectorDialog(QDialog):
 
 
 class ResultsView(QWidget):
-    """Displays a per-run results summary grouped by Passed/Failed/Skipped.
+    """Displays a per-run results summary grouped by the four report
+    statuses -- Matched/Partial/Failed/Skipped -- with reasons, per-item
+    detail, and (when present) verify outcomes rendered alongside restore
+    outcomes.
 
     Contains:
-    - A counts header label showing "Passed: X | Failed: Y | Skipped: Z"
-    - Three QGroupBox sections: "Passed", "Failed", "Skipped"
-    - Each group contains a QVBoxLayout with QLabel rows for each module
-    - Failed rows: "module_name \u2014 error message"
-    - Skipped rows: "module_name \u2014 reason"
-    - Passed rows: just "module_name"
+    - A counts header label showing
+      "Matched: X | Partial: Y | Failed: Z | Skipped: W"
+    - Four QGroupBox sections, in report-status order: "Matched", "Partial",
+      "Failed", "Skipped" -- so all four report statuses are visually
+      distinct (Req 8.1).
+    - Each group contains a QVBoxLayout with QLabel rows for each module.
+      A row is "module_name" alone, or "module_name \u2014 reason" when the
+      outcome's ``detail`` (the report's ``reason``) is non-empty (Req 8.3)
+      -- this applies to every group, not just Failed/Skipped.
+    - When the summary has any verify outcomes, a row for a module with a
+      matching verify outcome additionally appends
+      " | verify: <status> (<reason>)" (Req 3.4, 8.4). When
+      ``summary.verify_outcomes`` is empty, no row shows a verify suffix at
+      all (Req 3.5).
+    - Rows whose restore status is ``partial`` or ``failed`` render an
+      indented per-item block below the row, one line per item:
+      "item_name: status \u2014 detail (expected=..., actual=...)" with the
+      expected/actual segment present only when those values are given
+      (Req 8.2). Rows whose *verify* outcome is ``partial`` or ``failed``
+      render the same per-item block for the verify report's items,
+      prefixed "[verify]" to disambiguate from the restore item block
+      (Req 3.6, 8.5).
 
     Initially hidden until the first summary is shown via ``show_summary()``.
 
-    Requirements: 14.1, 14.2, 14.3, 14.7
+    Requirements: 3.4, 3.5, 3.6, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -880,10 +900,15 @@ class ResultsView(QWidget):
         self._counts_label = QLabel("", self)
         self._layout.addWidget(self._counts_label)
 
-        # Passed group
-        self._passed_group = QGroupBox("Passed", self)
-        self._passed_layout = QVBoxLayout(self._passed_group)
-        self._layout.addWidget(self._passed_group)
+        # Matched group
+        self._matched_group = QGroupBox("Matched", self)
+        self._matched_layout = QVBoxLayout(self._matched_group)
+        self._layout.addWidget(self._matched_group)
+
+        # Partial group
+        self._partial_group = QGroupBox("Partial", self)
+        self._partial_layout = QVBoxLayout(self._partial_group)
+        self._layout.addWidget(self._partial_group)
 
         # Failed group
         self._failed_group = QGroupBox("Failed", self)
@@ -901,39 +926,111 @@ class ResultsView(QWidget):
     def show_summary(self, summary: ResultsSummary) -> None:
         """Clear previous content and populate groups from the summary.
 
-        Updates the counts header and adds per-module rows to each group.
-        Makes the widget visible.
+        Updates the counts header and adds per-module rows (with reasons,
+        per-item detail, and verify suffixes where applicable) to each of
+        the four groups. Makes the widget visible.
         """
         # Clear previous rows from all groups
-        self._clear_layout(self._passed_layout)
+        self._clear_layout(self._matched_layout)
+        self._clear_layout(self._partial_layout)
         self._clear_layout(self._failed_layout)
         self._clear_layout(self._skipped_layout)
 
-        # Update counts header
-        passed_count, failed_count, skipped_count = summary.counts()
+        # Update counts header — order matches ResultsSummary.counts()
+        matched_count, partial_count, failed_count, skipped_count = summary.counts()
         self._counts_label.setText(
-            f"Passed: {passed_count} | Failed: {failed_count} | Skipped: {skipped_count}"
+            f"Matched: {matched_count} | Partial: {partial_count} | "
+            f"Failed: {failed_count} | Skipped: {skipped_count}"
         )
 
-        # Populate Passed group
-        for outcome in summary.passed():
-            label = QLabel(outcome.name, self)
-            self._passed_layout.addWidget(label)
+        # Verify results are only shown when the run actually verified
+        # anything -- an empty verify_outcomes list means no verify
+        # column/suffix at all (Req 3.5).
+        has_verify = bool(summary.verify_outcomes)
 
-        # Populate Failed group — show "module_name — error message"
-        for outcome in summary.failed():
-            text = f"{outcome.name} \u2014 {outcome.detail}" if outcome.detail else outcome.name
-            label = QLabel(text, self)
-            self._failed_layout.addWidget(label)
-
-        # Populate Skipped group — show "module_name — reason"
-        for outcome in summary.skipped():
-            text = f"{outcome.name} \u2014 {outcome.detail}" if outcome.detail else outcome.name
-            label = QLabel(text, self)
-            self._skipped_layout.addWidget(label)
+        groups = (
+            (summary.matched(), self._matched_layout),
+            (summary.partial(), self._partial_layout),
+            (summary.failed(), self._failed_layout),
+            (summary.skipped(), self._skipped_layout),
+        )
+        for outcomes, layout in groups:
+            for outcome in outcomes:
+                verify_outcome = summary.verify_for(outcome.name) if has_verify else None
+                self._add_row(layout, outcome, verify_outcome)
 
         # Make visible
         self.setVisible(True)
+
+    def _add_row(
+        self,
+        layout: QVBoxLayout,
+        outcome: ModuleOutcome,
+        verify_outcome: ModuleOutcome | None,
+    ) -> None:
+        """Add one module's row (plus any per-item detail) to ``layout``.
+
+        The row text is "module_name" alone, or "module_name — reason"
+        when outcome.detail is set (Req 8.3), with a
+        " | verify: <status> (<reason>)" suffix appended when a verify
+        outcome exists for this module (Req 3.4, 8.4). Per-item detail is
+        rendered, indented, for a partial/failed restore outcome
+        (Req 8.2) and, separately, for a partial/failed verify
+        outcome (Req 3.6).
+        """
+        text = outcome.name
+        if outcome.detail:
+            text += f" — {outcome.detail}"
+        if verify_outcome is not None:
+            v_text = f"verify: {verify_outcome.status.value}"
+            if verify_outcome.detail:
+                v_text += f" ({verify_outcome.detail})"
+            text += f" | {v_text}"
+        layout.addWidget(QLabel(text, self))
+
+        if outcome.status in (ModuleStatus.PARTIAL, ModuleStatus.FAILED):
+            for item in outcome.items:
+                self._add_item_row(layout, item)
+
+        if verify_outcome is not None and verify_outcome.status in (
+            ModuleStatus.PARTIAL,
+            ModuleStatus.FAILED,
+        ):
+            for item in verify_outcome.items:
+                self._add_item_row(layout, item, phase_prefix="verify")
+
+    def _add_item_row(
+        self, layout: QVBoxLayout, item: dict, phase_prefix: str | None = None
+    ) -> None:
+        """Add one indented per-item detail line to ``layout`` (Req 8.2)."""
+        label = QLabel(self._format_item_text(item, phase_prefix), self)
+        label.setContentsMargins(20, 0, 0, 0)
+        layout.addWidget(label)
+
+    @staticmethod
+    def _format_item_text(item: dict, phase_prefix: str | None = None) -> str:
+        """Format one report item dict as a single display line.
+
+        "item_name: status" plus " — detail" when present, plus
+        "(expected=..., actual=...)" when either value is present (None
+        is treated as "not given", per modules/report.py's contract) (Req
+        8.2). phase_prefix (e.g. "verify") disambiguates verify-phase
+        item lines from restore-phase ones when both are shown for the same
+        row (Req 3.6).
+        """
+        text = f"{item.get('name')}: {item.get('status')}"
+        if item.get("detail"):
+            text += f" — {item['detail']}"
+        extras = []
+        if item.get("expected") is not None:
+            extras.append(f"expected={item['expected']!r}")
+        if item.get("actual") is not None:
+            extras.append(f"actual={item['actual']!r}")
+        if extras:
+            text += f" ({', '.join(extras)})"
+        if phase_prefix:
+            text = f"[{phase_prefix}] {text}"
+        return text
 
     def _clear_layout(self, layout: QVBoxLayout) -> None:
         """Remove all widgets from a layout."""
@@ -1159,15 +1256,22 @@ class ExportWorker(QObject):
     """Background worker that executes an export Operation on a separate thread.
 
     Given an ``ExportConfig`` and an ``AppSelectionBridge``, the worker:
-    1. Resolves the run set via ``resolve_run_modules``.
+    1. Resolves the run set via ``export._build_modules`` (manifest order),
+       filtered by ``config.selected_modules``.
     2. Checks admin status for the ``power`` module (emits warning if not admin).
-    3. Creates the snapshot directory, applies the name, binds ``show_all``,
-       and injects the App_Selector via the bridge.
-    4. Runs each module, classifying outcomes with ``classify_export_outcome``.
-    5. Writes ``snapshot.json``, zips via ``export.zip_snapshot``, cleans temp folder.
-    6. Emits a success log with the archive path and format version.
-    7. On fatal error: removes any partial archive, emits error, ends operation.
-    8. Emits ``finished(ResultsSummary)`` signal.
+    3. Injects the AppSelectionBridge as the checklist replacement.
+    4. Resolves the snapshot directory via ``export.resolve_snapshot_dir``.
+    5. Runs the selected modules via ``export.run_export_modules``, under
+       ``LogStream`` stdout capture.
+    6. Classifies each module's outcome with ``classify_export_outcome``.
+    7. Builds metadata via ``export.build_snapshot_metadata``, writes
+       ``snapshot.json`` via ``export.write_snapshot_json``, zips via
+       ``export.zip_snapshot``, cleans the temp folder via
+       ``export.cleanup_snapshot_dir``, and emits a success log with the
+       archive path and format version.
+    8. Restores the original ``checklist.run`` in a ``finally`` block.
+    9. On fatal error: removes any partial archive, emits error, ends operation.
+    10. Emits ``finished(ResultsSummary)`` signal.
 
     Requirements: 2.4, 3.2, 3.3, 4.3, 4.4, 5.6, 6.1, 6.2, 7.1, 7.2, 7.3, 7.4, 7.5
     """
@@ -1200,16 +1304,19 @@ class ExportWorker(QObject):
     def run(self) -> None:
         """Execute the export operation (called on the Worker thread).
 
-        This method orchestrates the full export pipeline: module resolution,
-        admin check, snapshot directory creation, module execution, archive
-        creation, and cleanup. All progress is communicated via signals.
+        This method is a thin adapter over ``export.py``'s importable
+        pipeline functions: module resolution comes from
+        ``export._build_modules`` (manifest order), snapshot-dir resolution
+        from ``export.resolve_snapshot_dir``, module execution from
+        ``export.run_export_modules`` (under ``LogStream`` stdout capture),
+        and metadata/zip/cleanup from ``export.build_snapshot_metadata`` /
+        ``export.write_snapshot_json`` / ``export.zip_snapshot`` /
+        ``export.cleanup_snapshot_dir``. All progress is communicated via
+        signals.
         """
         import contextlib
-        import importlib
-        import json
-        import os
         import shutil
-        import stat
+        import types
 
         self.running_changed.emit(True)
         summary = ResultsSummary()
@@ -1217,121 +1324,93 @@ class ExportWorker(QObject):
         zip_path: Path | None = None
 
         try:
-            # 1. Resolve run set
-            run_modules = resolve_run_modules(
-                self._config.selected_modules, manifest.MODULE_NAMES
-            )
+            import export as export_module
 
-            # 2. Admin check for power module
-            if "power" in run_modules and not self._is_admin():
+            # 1. Resolve run set: export._build_modules yields (name, fn)
+            #    pairs in manifest order (fn already bound for apps'
+            #    show_all kwarg); filter down to the user's selection.
+            args_ns = types.SimpleNamespace(
+                show_all=self._config.show_all,
+                apps_selection="interactive",
+                apps_from=None,
+            )
+            modules_to_run = [
+                (name, fn)
+                for name, fn in export_module._build_modules(args_ns)
+                if name in self._config.selected_modules
+            ]
+
+            # 2. Admin check for power module (GUI-only convenience warning)
+            if "power" in self._config.selected_modules and not self._is_admin():
                 self._emit_log(
                     "Warning: power plan capture will be skipped because "
                     "Administrator privileges are not held.",
                     Severity.WARNING,
                 )
 
-            # 3. Generate snapshot name
-            name = self._config.name
-            if name is None:
-                name = default_snapshot_name(datetime.now())
-
-            # 4. Create snapshot directory
-            import export as export_module
-
-            snapshot_dir = export_module.create_snapshot_dir(self._config.output_dir)
-
-            # Apply custom name by renaming the directory
-            if self._config.name is not None:
-                named = snapshot_dir.parent / self._config.name
-                snapshot_dir.rename(named)
-                snapshot_dir = named
-
-            # 5. Inject the AppSelectionBridge as the checklist replacement
+            # 3. Inject the AppSelectionBridge as the checklist replacement
             import modules.checklist as checklist_module
             original_checklist_run = checklist_module.run
             checklist_module.run = self._bridge.request_app_selection
 
-            # 6. Prepare the stdout redirect to capture module print output
-            log_stream = LogStream()
-            log_stream.log_line.connect(self._emit_log)
+            try:
+                # 4. Resolve where this export writes to. This is a
+                #    belt-and-suspenders backend-side check: MainWindow
+                #    already pre-checks collisions synchronously on the UI
+                #    thread before starting this worker; this call is the
+                #    authoritative resolve-and-possibly-delete (and a
+                #    TOCTOU backstop for the rare race).
+                snapshot_dir = export_module.resolve_snapshot_dir(
+                    self._config.output_dir, self._config.name, self._config.force
+                )
 
-            # Build snapshot metadata
-            snapshot_data: dict = {
-                "winsnap_version": export_module.SNAPSHOT_FORMAT_VERSION,
-                "snapshot_format_version": export_module.SNAPSHOT_FORMAT_VERSION,
-                "exported_at": datetime.now().isoformat(),
-                "exported_on": {
-                    "user": os.environ.get("USERNAME", ""),
-                    "machine": os.environ.get("COMPUTERNAME", ""),
-                },
-                "modules_attempted": run_modules,
-                "modules": {},
-            }
+                # 5. Run every selected module under LogStream stdout capture
+                log_stream = LogStream()
+                log_stream.log_line.connect(self._emit_log)
+                with contextlib.redirect_stdout(log_stream):
+                    results = export_module.run_export_modules(
+                        modules_to_run, snapshot_dir
+                    )
+                log_stream.flush()
 
-            # 7. Run each module
-            for mod_name in run_modules:
-                try:
-                    mod = importlib.import_module(f"modules.{mod_name}")
-                    export_fn = mod.export
-
-                    # Bind show_all for apps module
-                    if mod_name == "apps":
-                        original_export = export_fn
-                        export_fn = lambda d, _fn=original_export: _fn(d, show_all=self._config.show_all)
-
-                    with contextlib.redirect_stdout(log_stream):
-                        result = export_fn(snapshot_dir)
-
-                    # Flush any remaining buffered output
-                    log_stream.flush()
-
-                    snapshot_data["modules"][mod_name] = result
+                # 6. Classify and emit each module's outcome
+                for mod_name, result in results.items():
                     outcome = classify_export_outcome(
                         mod_name, raised=None, result=result
                     )
-                except Exception as e:
-                    log_stream.flush()
-                    snapshot_data["modules"][mod_name] = {"error": str(e)}
-                    outcome = classify_export_outcome(
-                        mod_name, raised=e, result=None
-                    )
+                    summary.add(outcome)
+                    self.module_completed.emit(outcome)
 
-                summary.add(outcome)
-                self.module_completed.emit(outcome)
+                # 7. Build metadata, write snapshot.json, zip, and clean up
+                snapshot_data = export_module.build_snapshot_metadata(
+                    modules_attempted=[name for name, _ in modules_to_run]
+                )
+                snapshot_data["modules"] = results
+                export_module.write_snapshot_json(snapshot_dir, snapshot_data)
+                zip_path = export_module.zip_snapshot(snapshot_dir)
+                export_module.cleanup_snapshot_dir(snapshot_dir)
 
-            # 8. Restore original checklist.run
-            checklist_module.run = original_checklist_run
+                # Emit success logs
+                self._emit_log(
+                    f"Snapshot saved to: {zip_path}",
+                    Severity.SUCCESS,
+                )
+                self._emit_log(
+                    f"Format version: {export_module.SNAPSHOT_FORMAT_VERSION}",
+                    Severity.SUCCESS,
+                )
 
-            # 9. Write snapshot.json
-            json_path = snapshot_dir / "snapshot.json"
-            json_path.write_text(
-                json.dumps(snapshot_data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            except FileExistsError as e:
+                # Defense in depth: MainWindow's pre-check should already
+                # have resolved any collision (via overwrite confirmation)
+                # before this worker was started, so this path is normally
+                # unreachable outside of a TOCTOU race.
+                self._emit_log(str(e), Severity.ERROR)
 
-            # 10. Zip the snapshot
-            zip_path = export_module.zip_snapshot(snapshot_dir)
-
-            # 11. Clean up the temp snapshot folder
-            def _force_remove(func, path, _):
-                """If rmtree hits a permission error, chmod and retry."""
-                os.chmod(path, stat.S_IWRITE)
-                func(path)
-
-            try:
-                shutil.rmtree(snapshot_dir, onexc=_force_remove)
-            except Exception:
-                pass  # Non-fatal: temp folder cleanup failure
-
-            # 12. Emit success logs
-            self._emit_log(
-                f"Snapshot saved to: {zip_path}",
-                Severity.SUCCESS,
-            )
-            self._emit_log(
-                f"Format version: {export_module.SNAPSHOT_FORMAT_VERSION}",
-                Severity.SUCCESS,
-            )
+            finally:
+                # Always restore the original checklist.run, even if the
+                # export pipeline above raised.
+                checklist_module.run = original_checklist_run
 
         except Exception as e:
             # Fatal error: clean up partial archive and snapshot dir
@@ -1367,14 +1446,34 @@ class ExportWorker(QObject):
 class RestoreWorker(QObject):
     """Background worker that executes a restore operation.
 
-    Given a ``RestoreConfig``, this worker:
-    1. Opens the .winsnap archive and extracts to a temp directory
-    2. Reads snapshot.json
-    3. Evaluates the format version and logs date+version info
-    4. Halts on INCOMPATIBLE version; warns and continues on UNPARSEABLE
-    5. Resolves the run set in MODULES_RESTORE_ORDER
-    6. For each module: classifies outcome, runs restore or emits dry-run summary
-    7. Emits finished(ResultsSummary) when complete
+    This worker is a thin adapter over ``restore.py``'s importable
+    pipeline functions -- it never re-implements orchestration logic that
+    already exists as an importable backend function. Given a
+    ``RestoreConfig``, it:
+    1. Extracts the archive to a temp directory via ``restore.safe_extract``
+       (refuses zip-slip archives wholesale) and locates the snapshot
+       directory via ``restore.find_snapshot_dir`` (root first, then
+       immediate subdirectories).
+    2. Reads snapshot.json and evaluates its format version via
+       ``restore.evaluate_snapshot_version`` / ``to_version_verdict``,
+       halting on INCOMPATIBLE and warning-and-continuing on UNPARSEABLE.
+    3. Resolves the run set from ``restore.ALL_MODULES`` (manifest order)
+       filtered by ``config.selected_modules``; emits a ``skip_outcome``
+       row for every manifest module the user did not select, and uses
+       ``restore.partition_modules`` to identify modules that are selected
+       but absent from the snapshot or export-errored.
+    4. For dry runs: calls ``restore.run_dry_run`` under ``LogStream``
+       stdout capture and returns -- verify never runs for a dry run.
+    5. For real restores: calls ``restore.run_modules`` under ``LogStream``
+       stdout capture and maps each attempted module's report to a
+       ``ModuleOutcome`` via ``report_to_outcome`` (classification comes
+       from the report's ``status`` field, never from whether the call
+       raised); the single deferred Explorer restart is handled entirely
+       inside ``run_modules``.
+    6. When ``config.verify`` is set: calls ``restore.run_verify`` under
+       ``LogStream`` stdout capture and records verify outcomes separately
+       via ``summary.add_verify``.
+    7. Emits ``finished(ResultsSummary)`` when complete.
 
     Signals:
         log(str, Severity): Emitted for each log message with its severity.
@@ -1382,7 +1481,8 @@ class RestoreWorker(QObject):
         finished(ResultsSummary): Emitted when the operation completes.
         running_changed(bool): Emitted at start (True) and end (False).
 
-    Requirements: 8.2, 8.3, 8.4, 9.3, 9.6, 9.7, 10.1, 10.2, 10.3, 10.4, 10.5, 14.6
+    Requirements: 1.1, 1.3, 1.4, 1.6, 2.1, 2.2, 2.3, 2.4, 3.2, 3.3, 3.4, 3.5,
+    4.1, 4.3, 4.4, 6.1, 6.2, 6.3, 6.4, 7.1, 7.2, 8.5, 8.8, 11.4, 11.5, 11.7
     """
 
     log = pyqtSignal(str, Severity)
@@ -1408,7 +1508,18 @@ class RestoreWorker(QObject):
             self.running_changed.emit(False)
 
     def _do_restore(self, summary: ResultsSummary) -> None:
-        """Internal restore logic, separated for clean exception handling."""
+        """Internal restore logic, separated for clean exception handling.
+
+        A thin adapter over restore.py's importable pipeline functions:
+        extraction (``safe_extract``), snapshot-dir discovery
+        (``find_snapshot_dir``), version evaluation
+        (``evaluate_snapshot_version`` / ``to_version_verdict``), and the
+        module run/verify loops (``run_dry_run`` / ``run_modules`` /
+        ``run_verify``), all under ``LogStream`` stdout capture. Outcomes
+        are always classified from the returned report's ``status`` field
+        via ``report_to_outcome``/``skip_outcome`` -- never from whether a
+        call raised (Req 1.1, 1.6).
+        """
         import restore as _restore
 
         snapshot_path = self._config.snapshot_path
@@ -1429,140 +1540,141 @@ class RestoreWorker(QObject):
             )
             return
 
-        # --- Extract to temp directory ---
+        # --- Extract to temp directory (Req 4.1, 4.2: safe_extract refuses
+        #     the entire archive on zip-slip, no partial extraction trusted) ---
         tmp_dir = Path(tempfile.mkdtemp(prefix="winsnap_restore_"))
         try:
             with zf:
-                zf.extractall(tmp_dir)
+                try:
+                    _restore.safe_extract(zf, tmp_dir)
+                except _restore.ZipSlipError as e:
+                    self.log.emit(
+                        f"Archive rejected as unsafe: {e}", Severity.ERROR
+                    )
+                    return
 
-            # Find the snapshot directory (top-level folder inside the zip)
-            extracted_dirs = [d for d in tmp_dir.iterdir() if d.is_dir()]
-            if not extracted_dirs:
+            # --- Locate the snapshot directory (Req 4.3, 4.4: extraction
+            #     root first, then immediate subdirectories -- not "first
+            #     extracted subdir") ---
+            try:
+                snapshot_dir = _restore.find_snapshot_dir(tmp_dir)
+            except _restore.SnapshotLayoutError as e:
                 self.log.emit(
-                    "Snapshot archive appears empty.", Severity.ERROR
+                    f"Not a recognizable snapshot archive: {e}",
+                    Severity.ERROR,
                 )
                 return
-            snapshot_dir = extracted_dirs[0]
 
             # --- Read snapshot.json ---
-            json_path = snapshot_dir / "snapshot.json"
-            if not json_path.exists():
-                self.log.emit(
-                    "snapshot.json not found in archive.", Severity.ERROR
-                )
-                return
-
-            snapshot = json.loads(json_path.read_text(encoding="utf-8"))
-
-            # --- Evaluate format version (Requirement 10.1, 10.2, 10.3, 10.4, 10.5) ---
-            raw_version = snapshot.get("snapshot_format_version")
-            verdict, _parsed_major = evaluate_version(
-                raw_version, _restore.SUPPORTED_MAJOR
+            snapshot = json.loads(
+                (snapshot_dir / "snapshot.json").read_text(encoding="utf-8")
             )
 
-            # Log version info with "unknown" placeholders (Requirement 10.3)
+            # --- Evaluate format version (Req 7.1, 7.2, 7.3) ---
+            evaluation = _restore.evaluate_snapshot_version(snapshot)
+            verdict = to_version_verdict(evaluation)
+
+            # Log version info with "unknown" placeholders
             version_msg = format_version_info_message(snapshot)
             self.log.emit(version_msg, Severity.SUCCESS)
 
-            # Halt on INCOMPATIBLE (Requirement 10.2)
+            # Halt on INCOMPATIBLE
             if verdict == VersionVerdict.INCOMPATIBLE:
                 self.log.emit(
-                    f"Snapshot format version {raw_version} is newer than this "
+                    f"Snapshot format v{evaluation.raw} is newer than this "
                     f"restorer supports (v{_restore.SUPPORTED_MAJOR}.x). "
                     f"Update WinSnap and try again.",
                     Severity.ERROR,
                 )
                 return
 
-            # Warn on UNPARSEABLE (Requirement 10.5)
+            # Warn on UNPARSEABLE and continue
             if verdict == VersionVerdict.UNPARSEABLE:
                 self.log.emit(
-                    f"Unrecognized snapshot version format: {raw_version!r}. "
-                    f"Attempting restore anyway.",
+                    f"Unrecognized snapshot version format: "
+                    f"{evaluation.raw!r}. Attempting restore anyway.",
                     Severity.WARNING,
                 )
 
-            # --- Resolve run set (Requirement 9.3) ---
-            run_modules = resolve_run_modules(
-                self._config.selected_modules, manifest.MODULE_NAMES
-            )
-
-            # Build a lookup from module key to module object
-            module_map: dict[str, object] = {
-                key: mod for key, mod in _restore.ALL_MODULES
-            }
-
-            # Get modules data from snapshot
+            # --- Resolve run set: manifest order via ALL_MODULES, filtered
+            #     by the user's selection (Req 5.1, 5.2) ---
+            modules_to_run = [
+                (key, mod) for key, mod in _restore.ALL_MODULES
+                if key in self._config.selected_modules
+            ]
             modules_data = snapshot.get("modules", {})
+            _, skipped = _restore.partition_modules(modules_to_run, modules_data)
 
-            # --- Process each module in restore order ---
-            for name in MODULES_RESTORE_ORDER:
-                selected = name in self._config.selected_modules
-                present = name in modules_data
-                export_errored = False
-
-                if present and isinstance(modules_data.get(name), dict):
-                    export_errored = "error" in modules_data[name]
-
-                # Determine if we should skip this module
-                if not selected or not present or export_errored:
-                    outcome = classify_restore_outcome(
-                        name,
-                        selected=selected,
-                        present=present,
-                        export_errored=export_errored,
-                        raised=None,
-                    )
+            # Emit a skip row for every manifest module the user did not
+            # select. This is a distinct population from `skipped` above
+            # (deselected vs. selected-but-not-found/export-errored) (Req
+            # 1.3, 2.2).
+            for key in manifest.MODULE_NAMES:
+                if key not in self._config.selected_modules:
+                    outcome = skip_outcome(key, "deselected")
                     summary.add(outcome)
                     self.module_completed.emit(outcome)
-                    continue
 
-                # Module is selected, present, and not export-errored
-                if self._config.dry_run:
-                    # Dry-run: emit summary text, apply no changes (Req 9.6, 9.7)
-                    dry_text = _restore._summarize(name, modules_data[name])
-                    self.log.emit(
-                        f"[{name}] {dry_text}", Severity.SUCCESS
-                    )
-                    outcome = classify_restore_outcome(
-                        name,
-                        selected=True,
-                        present=True,
-                        export_errored=False,
-                        raised=None,
-                    )
-                    summary.add(outcome)
-                    self.module_completed.emit(outcome)
-                    continue
+            if self._config.dry_run:
+                # Dry run: apply no changes, bypass verify entirely, like
+                # the CLI (Req 8.8, 3.5/8.5).
+                log_stream = LogStream()
+                log_stream.log_line.connect(self.log.emit)
+                with contextlib.redirect_stdout(log_stream):
+                    dry_results = _restore.run_dry_run(modules_to_run, modules_data)
+                log_stream.flush()
 
-                # Actually run the module's restore function
-                mod = module_map.get(name)
-                raised: Exception | None = None
-
-                if mod is not None:
-                    log_stream = LogStream()
-                    log_stream.log_line.connect(self.log.emit)
-                    try:
-                        with contextlib.redirect_stdout(log_stream):
-                            mod.restore(modules_data[name], snapshot_dir)  # type: ignore[union-attr]
-                    except Exception as e:
-                        raised = e
-                        self.log.emit(
-                            f"[{name}] ERROR during restore: {e}",
-                            Severity.ERROR,
+                for key, mod in modules_to_run:
+                    if key in skipped:
+                        outcome = skip_outcome(key, skipped[key])
+                    else:
+                        outcome = ModuleOutcome(
+                            name=key,
+                            status=ModuleStatus.MATCHED,
+                            detail=dry_results[key]["summary"],
                         )
-                    finally:
-                        log_stream.flush()
+                    summary.add(outcome)
+                    self.module_completed.emit(outcome)
+                return
 
-                outcome = classify_restore_outcome(
-                    name,
-                    selected=True,
-                    present=True,
-                    export_errored=False,
-                    raised=raised,
+            # --- Real restore: run every attempted module under LogStream
+            #     stdout capture. run_modules synthesizes a failed report
+            #     for a module that raises, and a skipped report for one
+            #     that returns None -- the run continues regardless (Req
+            #     1.6, 2.3). The single deferred Explorer restart (Req 6.1-
+            #     6.4) happens entirely inside run_modules. ---
+            log_stream = LogStream()
+            log_stream.log_line.connect(self.log.emit)
+            with contextlib.redirect_stdout(log_stream):
+                reports = _restore.run_modules(
+                    modules_to_run, modules_data, snapshot_dir, dry_run=False
                 )
+            log_stream.flush()
+
+            for key, mod in modules_to_run:
+                if key in skipped:
+                    outcome = skip_outcome(key, skipped[key])
+                else:
+                    # key not in skipped => run_modules attempted it =>
+                    # reports[key] exists (synthesized if it raised/None).
+                    outcome = report_to_outcome(key, reports[key])
                 summary.add(outcome)
                 self.module_completed.emit(outcome)
+
+            # --- Verify, if requested (Req 3.2, 3.3) ---
+            if self._config.verify:
+                log_stream = LogStream()
+                log_stream.log_line.connect(self.log.emit)
+                with contextlib.redirect_stdout(log_stream):
+                    verify_reports = _restore.run_verify(
+                        modules_to_run, modules_data, snapshot_dir
+                    )
+                log_stream.flush()
+
+                for key, verify_report in verify_reports.items():
+                    outcome = report_to_outcome(key, verify_report)
+                    summary.add_verify(outcome)
+                    self.module_completed.emit(outcome)
 
         finally:
             # Clean up temp directory
@@ -1652,6 +1764,11 @@ class MainWindow(QMainWindow):
         self._worker_thread: QThread | None = None
         self._bridge: AppSelectionBridge | None = None
 
+        # --- Config validated (and possibly force-amended) by
+        # try_start_export(); _start_export() consumes this instead of
+        # independently rebuilding an ExportConfig from the view (Req 9.3) ---
+        self._pending_export_config: ExportConfig | None = None
+
         # --- Connect start buttons ---
         self._start_export_btn.clicked.connect(self._start_export)
         self._start_restore_btn.clicked.connect(self._start_restore)
@@ -1664,9 +1781,15 @@ class MainWindow(QMainWindow):
         2. Running on Windows (Req 1.5)
         3. Snapshot name is valid if provided (Req 2.7)
         4. At least one module is selected (Req 3.8)
+        5. Output path does not collide with an existing snapshot -- or the
+           user authorizes an overwrite (Req 9.1, 9.2, 9.3)
 
         Emits appropriate error/warning log entries and returns False on
-        guard failure. Returns True if all guards pass.
+        guard failure. Returns True if all guards pass. On success, the
+        validated (possibly force-amended) ExportConfig is stashed in
+        ``self._pending_export_config`` for ``_start_export()`` to consume,
+        so the two methods never independently rebuild an ExportConfig from
+        the view (Req 9.3).
         """
         # Guard: operation already in progress (Req 1.4)
         if self._operation_in_progress:
@@ -1709,6 +1832,42 @@ class MainWindow(QMainWindow):
             ))
             return False
 
+        # Guard: output-path collision pre-check (Req 9.1, 9.2, 9.3).
+        # Uses the same importable function the CLI uses, called
+        # synchronously on the UI thread with force=False -- a cheap
+        # filesystem check that only raises; it does not touch disk on the
+        # non-collision path. This runs BEFORE the worker thread starts, so
+        # the user gets a synchronous confirmation instead of the worker
+        # failing asynchronously after modules may have already run.
+        if config.name:
+            import export as export_module
+            try:
+                export_module.resolve_output_path(
+                    config.output_dir, config.name, force=False
+                )
+            except FileExistsError as e:
+                reply = QMessageBox.question(
+                    self,
+                    "Snapshot already exists",
+                    f"A snapshot named '{config.name}' already exists at "
+                    f"{config.output_dir}. Overwrite it?\n\n{e}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    config.force = True
+                else:
+                    self._log_panel.append(LogEntry(
+                        timestamp=datetime.now().strftime("%H:%M:%S"),
+                        message=f"Export cancelled: {e}",
+                        severity=Severity.ERROR,
+                    ))
+                    return False
+
+        # Stash the validated (possibly force-amended) config for
+        # _start_export() -- the single ExportConfig object that flows
+        # through to ExportWorker (Req 9.3).
+        self._pending_export_config = config
         return True
 
     def try_start_restore(self) -> bool:
@@ -1796,22 +1955,38 @@ class MainWindow(QMainWindow):
 
         Validates preconditions via try_start_export(), then:
         - Sets _operation_in_progress = True
-        - Builds ExportConfig from ExportView
+        - Uses the ExportConfig validated by try_start_export()
         - Creates AppSelectionBridge
         - Creates ExportWorker with config and bridge
         - Creates QThread, moves worker to thread
         - Connects all signals
         - Starts the thread
 
-        Requirements: 11.2, 14.1, 15.1, 15.2, 15.4, 15.5
+        Requirements: 9.3, 11.2, 14.1, 15.1, 15.2, 15.4, 15.5
         """
         if not self.try_start_export():
             return
 
         self._operation_in_progress = True
 
-        # Build config from the export view
-        config = self._export_view.build_config()
+        # Use the config validated (and possibly force-amended by the
+        # overwrite confirmation) by try_start_export() -- do NOT rebuild
+        # from the view here, since that would silently drop the
+        # collision-check's force=True amendment and could observe widget
+        # state that changed between the guard check and this call
+        # (Req 9.3: a single ExportConfig object flows through to
+        # ExportWorker).
+        config = self._pending_export_config
+        if config is None:
+            # Defensive: should be unreachable, since try_start_export()
+            # just returned True and always stages a config on success.
+            self._log_panel.append(LogEntry(
+                timestamp=datetime.now().strftime("%H:%M:%S"),
+                message="Internal error: no validated export config to start",
+                severity=Severity.ERROR,
+            ))
+            self._operation_in_progress = False
+            return
 
         # Create the bridge for app selection cross-thread communication
         self._bridge = AppSelectionBridge()

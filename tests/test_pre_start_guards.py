@@ -16,7 +16,7 @@ import pytest
 # Force offscreen rendering for headless CI
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 # Ensure a QApplication exists before any widget tests
 _app = QApplication.instance() or QApplication(sys.argv)
@@ -106,6 +106,97 @@ class TestTryStartExportGuards:
         # Only the "already in progress" message should appear
         assert len(window._log_panel._entries) == 1
         assert "already in progress" in window._log_panel._entries[0].message
+
+
+class TestTryStartExportCollisionGuard:
+    """Tests for try_start_export()'s output-path collision pre-check
+    (Req 9.1, 9.2, 9.3). Exercises export.resolve_output_path via a real
+    colliding directory on disk (tmp_path), mocking only QMessageBox."""
+
+    def test_no_collision_does_not_prompt(self, tmp_path):
+        """When the resolved output path does not collide, QMessageBox
+        should never be shown, and the guard passes with force left False."""
+        window = MainWindow()
+        window._export_view._output_dir = tmp_path
+        window._export_view._name_edit.setText("brand_new_snapshot")
+
+        with patch("gui.sys.platform", "win32"), \
+             patch("gui.QMessageBox.question") as mock_question:
+            result = window.try_start_export()
+
+        assert result is True
+        mock_question.assert_not_called()
+        assert len(window._log_panel._entries) == 0
+        assert window._pending_export_config is not None
+        assert window._pending_export_config.force is False
+        assert window._pending_export_config.name == "brand_new_snapshot"
+
+    def test_collision_yes_sets_force_and_stages_same_config(self, tmp_path):
+        """QMessageBox 'Yes' should set config.force=True, let the guard
+        pass, and stage that SAME ExportConfig object for _start_export()
+        to hand to ExportWorker (no re-build from the view)."""
+        window = MainWindow()
+        window._export_view._output_dir = tmp_path
+        window._export_view._name_edit.setText("existing_snapshot")
+        # Pre-create a colliding snapshot directory so resolve_output_path
+        # raises FileExistsError.
+        (tmp_path / "existing_snapshot").mkdir()
+
+        with patch("gui.sys.platform", "win32"), \
+             patch(
+                 "gui.QMessageBox.question",
+                 return_value=QMessageBox.StandardButton.Yes,
+             ) as mock_question:
+            result = window.try_start_export()
+
+        assert result is True
+        mock_question.assert_called_once()
+        assert len(window._log_panel._entries) == 0
+        assert window._pending_export_config is not None
+        assert window._pending_export_config.force is True
+        assert window._pending_export_config.name == "existing_snapshot"
+
+    def test_collision_no_logs_error_and_aborts(self, tmp_path):
+        """QMessageBox 'No' should log the conflict as an error and abort
+        the start -- no config staged for _start_export(), so no module
+        can run."""
+        window = MainWindow()
+        window._export_view._output_dir = tmp_path
+        window._export_view._name_edit.setText("existing_snapshot")
+        (tmp_path / "existing_snapshot").mkdir()
+
+        with patch("gui.sys.platform", "win32"), \
+             patch(
+                 "gui.QMessageBox.question",
+                 return_value=QMessageBox.StandardButton.No,
+             ) as mock_question:
+            result = window.try_start_export()
+
+        assert result is False
+        mock_question.assert_called_once()
+        assert window._pending_export_config is None
+        assert len(window._log_panel._entries) == 1
+        entry = window._log_panel._entries[0]
+        assert entry.severity == Severity.ERROR
+        assert "existing_snapshot" in entry.message
+
+    def test_collision_checked_against_winsnap_zip_too(self, tmp_path):
+        """A colliding <name>.winsnap file (a previous export) triggers the
+        same prompt as a colliding directory."""
+        window = MainWindow()
+        window._export_view._output_dir = tmp_path
+        window._export_view._name_edit.setText("prior_export")
+        (tmp_path / "prior_export.winsnap").write_bytes(b"")
+
+        with patch("gui.sys.platform", "win32"), \
+             patch(
+                 "gui.QMessageBox.question",
+                 return_value=QMessageBox.StandardButton.No,
+             ) as mock_question:
+            result = window.try_start_export()
+
+        assert result is False
+        mock_question.assert_called_once()
 
 
 class TestTryStartRestoreGuards:

@@ -1,7 +1,7 @@
 """Integration tests for ExportWorker.
 
 Tests verify end-to-end behavior of the ExportWorker including:
-- Archive creation with mocked modules
+- Archive creation with monkeypatched module export() functions
 - Fatal-error cleanup (no partial archive left)
 - Admin warning emission for the power module
 - Module failures don't stop the operation (other modules still run)
@@ -9,15 +9,29 @@ Tests verify end-to-end behavior of the ExportWorker including:
 Tests run with QT_QPA_PLATFORM=offscreen so no display is required.
 ExportWorker.run() is called directly (not via QThread) for testing.
 
-Requirements: 7.1, 7.2, 7.5, 6.1
+ExportWorker.run() is now a thin adapter over export.py's importable
+pipeline functions (export.resolve_snapshot_dir, export.run_export_modules,
+export.build_snapshot_metadata, export.write_snapshot_json,
+export.zip_snapshot, export.cleanup_snapshot_dir), with module resolution
+via export._build_modules (manifest order) filtered by
+config.selected_modules. Tests here monkeypatch individual modules'
+export() functions (the actual seam _build_modules reads at call time) and
+export.py's pipeline functions directly, rather than the old
+importlib.import_module()/export.create_snapshot_dir seams the rewritten
+worker no longer touches -- create_snapshot_dir is now only reached
+*inside* resolve_snapshot_dir, on the unnamed-export branch.
+
+Collision fail-fast, force-overwrite, and snapshot-metadata-builder parity
+coverage now live in tests/test_export_worker_adapters.py (added by task
+5.3); this file's scope is the archive-creation happy path, per-module
+failure isolation, fatal-error cleanup, and the admin warning.
+
+Requirements: 6.1, 7.1, 7.2, 7.5, 11.6
 """
 
 import os
 import sys
-import json
-import zipfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 # Force offscreen rendering for headless CI
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -28,6 +42,11 @@ from PyQt6.QtWidgets import QApplication
 _app = QApplication.instance() or QApplication(sys.argv)
 
 import pytest
+
+import export as export_module
+import modules.wallpaper as wallpaper_module
+import modules.mouse_display as mouse_display_module
+import modules.power as power_module
 
 from gui import (
     ExportWorker,
@@ -72,14 +91,14 @@ def _collect_signals(worker: ExportWorker) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Test: Archive creation with mocked modules (Requirement 7.1, 7.2)
+# Test: Archive creation with monkeypatched modules (Requirement 7.1, 7.2)
 # ---------------------------------------------------------------------------
 
 
 class TestExportWorkerArchiveCreation:
     """Test that ExportWorker creates a .winsnap archive when modules succeed."""
 
-    def test_creates_archive_on_success(self, tmp_path):
+    def test_creates_archive_on_success(self, tmp_path, monkeypatch):
         """ExportWorker should create a .winsnap archive when modules succeed.
 
         Validates: Requirements 7.1, 7.2
@@ -89,43 +108,18 @@ class TestExportWorkerArchiveCreation:
         worker = ExportWorker(config, bridge)
         collected = _collect_signals(worker)
 
-        # Mock create_snapshot_dir to return a temp dir
-        snapshot_dir = tmp_path / "test_snapshot"
-        snapshot_dir.mkdir()
+        monkeypatch.setattr(
+            wallpaper_module, "export",
+            lambda d: {"enabled": True, "filename": "wallpaper.jpg"},
+        )
+        monkeypatch.setattr(mouse_display_module, "export", lambda d: {"speed": 10})
 
-        # Mock zip_snapshot to create a dummy zip
+        worker.run()
+
+        # With name="test_snapshot", resolve_snapshot_dir resolves to
+        # tmp_path/test_snapshot and the real (unmocked) zip_snapshot
+        # appends ".winsnap" -- this is a genuine end-to-end zip.
         zip_path = tmp_path / "test_snapshot.winsnap"
-
-        def fake_zip_snapshot(sdir):
-            with zipfile.ZipFile(zip_path, "w") as zf:
-                for f in sdir.rglob("*"):
-                    if f.is_file():
-                        zf.write(f, f.relative_to(sdir.parent))
-            return zip_path
-
-        # Mock modules to return simple dicts
-        fake_wallpaper = MagicMock()
-        fake_wallpaper.export = MagicMock(return_value={"enabled": True, "filename": "wallpaper.jpg"})
-
-        fake_mouse_display = MagicMock()
-        fake_mouse_display.export = MagicMock(return_value={"speed": 10})
-
-        with patch("export.create_snapshot_dir", return_value=snapshot_dir), \
-             patch("export.zip_snapshot", side_effect=fake_zip_snapshot), \
-             patch("importlib.import_module") as mock_import:
-
-            def import_side_effect(name):
-                if name == "modules.wallpaper":
-                    return fake_wallpaper
-                elif name == "modules.mouse_display":
-                    return fake_mouse_display
-                raise ImportError(f"No module named {name}")
-
-            mock_import.side_effect = import_side_effect
-
-            worker.run()
-
-        # Verify archive was created
         assert zip_path.exists(), "Expected .winsnap archive to be created"
 
         # Verify success log with archive path was emitted (Requirement 7.2)
@@ -142,12 +136,13 @@ class TestExportWorkerArchiveCreation:
         summary = collected["finished"][0]
         assert isinstance(summary, ResultsSummary)
 
-        # Verify both modules passed
-        passed_names = [o.name for o in summary.passed()]
-        assert "wallpaper" in passed_names
-        assert "mouse_display" in passed_names
+        # Verify both modules matched (ModuleStatus.PASSED was removed;
+        # the success status is now ModuleStatus.MATCHED)
+        matched_names = [o.name for o in summary.matched()]
+        assert "wallpaper" in matched_names
+        assert "mouse_display" in matched_names
 
-    def test_module_failure_does_not_stop_operation(self, tmp_path):
+    def test_module_failure_does_not_stop_operation(self, tmp_path, monkeypatch):
         """A module failure should not prevent other modules from running.
 
         Validates: Requirement 7.3
@@ -157,39 +152,17 @@ class TestExportWorkerArchiveCreation:
         worker = ExportWorker(config, bridge)
         collected = _collect_signals(worker)
 
-        snapshot_dir = tmp_path / "test_snapshot"
-        snapshot_dir.mkdir()
+        def failing_export(snapshot_dir):
+            raise RuntimeError("wallpaper failed")
 
-        zip_path = tmp_path / "test_snapshot.winsnap"
+        # wallpaper raises, mouse_display succeeds. run_export_modules
+        # catches the raise per-module and synthesizes {"error": str(e)},
+        # so the failure is classified via the result dict's "error" key,
+        # not via an uncaught exception propagating out of the worker.
+        monkeypatch.setattr(wallpaper_module, "export", failing_export)
+        monkeypatch.setattr(mouse_display_module, "export", lambda d: {"speed": 10})
 
-        def fake_zip_snapshot(sdir):
-            with zipfile.ZipFile(zip_path, "w") as zf:
-                for f in sdir.rglob("*"):
-                    if f.is_file():
-                        zf.write(f, f.relative_to(sdir.parent))
-            return zip_path
-
-        # wallpaper raises, mouse_display succeeds
-        fake_wallpaper = MagicMock()
-        fake_wallpaper.export = MagicMock(side_effect=RuntimeError("wallpaper failed"))
-
-        fake_mouse_display = MagicMock()
-        fake_mouse_display.export = MagicMock(return_value={"speed": 10})
-
-        with patch("export.create_snapshot_dir", return_value=snapshot_dir), \
-             patch("export.zip_snapshot", side_effect=fake_zip_snapshot), \
-             patch("importlib.import_module") as mock_import:
-
-            def import_side_effect(name):
-                if name == "modules.wallpaper":
-                    return fake_wallpaper
-                elif name == "modules.mouse_display":
-                    return fake_mouse_display
-                raise ImportError(f"No module named {name}")
-
-            mock_import.side_effect = import_side_effect
-
-            worker.run()
+        worker.run()
 
         # Verify both modules were attempted
         summary = collected["finished"][0]
@@ -197,13 +170,14 @@ class TestExportWorkerArchiveCreation:
         assert "wallpaper" in all_names
         assert "mouse_display" in all_names
 
-        # wallpaper should be FAILED, mouse_display should be PASSED
+        # wallpaper should be FAILED, mouse_display should be MATCHED
         failed_names = [o.name for o in summary.failed()]
-        passed_names = [o.name for o in summary.passed()]
+        matched_names = [o.name for o in summary.matched()]
         assert "wallpaper" in failed_names
-        assert "mouse_display" in passed_names
+        assert "mouse_display" in matched_names
 
         # Archive should still be created
+        zip_path = tmp_path / "test_snapshot.winsnap"
         assert zip_path.exists()
 
 
@@ -215,7 +189,7 @@ class TestExportWorkerArchiveCreation:
 class TestExportWorkerFatalErrorCleanup:
     """Test that on fatal error, no partial archive is left."""
 
-    def test_no_partial_archive_on_fatal_error(self, tmp_path):
+    def test_no_partial_archive_on_fatal_error(self, tmp_path, monkeypatch):
         """When a fatal error occurs, no partial .winsnap archive should remain.
 
         Validates: Requirement 7.5
@@ -225,9 +199,15 @@ class TestExportWorkerFatalErrorCleanup:
         worker = ExportWorker(config, bridge)
         collected = _collect_signals(worker)
 
-        # Make create_snapshot_dir raise to simulate output dir not writable
-        with patch("export.create_snapshot_dir", side_effect=PermissionError("Output dir not writable")):
-            worker.run()
+        # Make resolve_snapshot_dir raise to simulate output dir not
+        # writable -- this is the worker's actual snapshot-dir-resolution
+        # seam now (create_snapshot_dir is only reached from inside it).
+        def _raise_permission_error(*args, **kwargs):
+            raise PermissionError("Output dir not writable")
+
+        monkeypatch.setattr(export_module, "resolve_snapshot_dir", _raise_permission_error)
+
+        worker.run()
 
         # Verify no .winsnap files exist in the output directory
         winsnap_files = list(tmp_path.glob("*.winsnap"))
@@ -240,7 +220,7 @@ class TestExportWorkerFatalErrorCleanup:
         # Verify finished signal was still emitted (so UI can re-enable controls)
         assert len(collected["finished"]) == 1
 
-    def test_snapshot_dir_cleaned_on_zip_failure(self, tmp_path):
+    def test_snapshot_dir_cleaned_on_zip_failure(self, tmp_path, monkeypatch):
         """If zip_snapshot fails, the snapshot directory should be cleaned up.
 
         Validates: Requirement 7.5
@@ -250,24 +230,20 @@ class TestExportWorkerFatalErrorCleanup:
         worker = ExportWorker(config, bridge)
         collected = _collect_signals(worker)
 
-        snapshot_dir = tmp_path / "test_snapshot"
-        snapshot_dir.mkdir()
+        monkeypatch.setattr(wallpaper_module, "export", lambda d: {"enabled": True})
 
         def failing_zip(sdir):
             raise OSError("Disk full")
 
-        fake_wallpaper = MagicMock()
-        fake_wallpaper.export = MagicMock(return_value={"enabled": True})
+        monkeypatch.setattr(export_module, "zip_snapshot", failing_zip)
 
-        with patch("export.create_snapshot_dir", return_value=snapshot_dir), \
-             patch("export.zip_snapshot", side_effect=failing_zip), \
-             patch("importlib.import_module") as mock_import:
+        worker.run()
 
-            mock_import.return_value = fake_wallpaper
-
-            worker.run()
-
-        # The snapshot directory should have been cleaned up
+        # zip_snapshot raising leaves zip_path unset (the assignment never
+        # completes) but snapshot_dir was already created by the real
+        # resolve_snapshot_dir call -- the outer fatal-error handler must
+        # rmtree it.
+        snapshot_dir = tmp_path / "test_snapshot"
         assert not snapshot_dir.exists(), "Snapshot dir should be removed on fatal error"
 
         # No .winsnap files should exist
@@ -290,7 +266,7 @@ class TestExportWorkerFatalErrorCleanup:
 class TestExportWorkerAdminWarning:
     """Test that a warning is emitted when power module is selected without admin."""
 
-    def test_admin_warning_emitted_when_not_admin(self, tmp_path):
+    def test_admin_warning_emitted_when_not_admin(self, tmp_path, monkeypatch):
         """When power is selected and process is not admin, a warning log should be emitted.
 
         Validates: Requirement 6.1
@@ -300,32 +276,16 @@ class TestExportWorkerAdminWarning:
         worker = ExportWorker(config, bridge)
         collected = _collect_signals(worker)
 
-        snapshot_dir = tmp_path / "test_snapshot"
-        snapshot_dir.mkdir()
-
-        zip_path = tmp_path / "test_snapshot.winsnap"
-
-        def fake_zip_snapshot(sdir):
-            with zipfile.ZipFile(zip_path, "w") as zf:
-                for f in sdir.rglob("*"):
-                    if f.is_file():
-                        zf.write(f, f.relative_to(sdir.parent))
-            return zip_path
-
         # Power module returns not_admin skip result
-        fake_power = MagicMock()
-        fake_power.export = MagicMock(return_value={"enabled": False, "skip_reason": "not_admin"})
+        monkeypatch.setattr(
+            power_module, "export",
+            lambda d: {"enabled": False, "skip_reason": "not_admin"},
+        )
+        monkeypatch.setattr(worker, "_is_admin", lambda: False)
 
-        with patch("export.create_snapshot_dir", return_value=snapshot_dir), \
-             patch("export.zip_snapshot", side_effect=fake_zip_snapshot), \
-             patch("importlib.import_module") as mock_import, \
-             patch.object(worker, "_is_admin", return_value=False):
+        worker.run()
 
-            mock_import.return_value = fake_power
-
-            worker.run()
-
-        # Verify a warning log was emitted BEFORE the power module runs
+        # Verify a warning log was emitted
         warning_logs = [(msg, sev) for msg, sev in collected["logs"] if sev == Severity.WARNING]
         assert len(warning_logs) > 0, "Expected a warning log about admin privileges"
 
@@ -336,7 +296,7 @@ class TestExportWorkerAdminWarning:
             "Expected warning about power plan capture being skipped due to lack of admin"
         )
 
-    def test_no_admin_warning_when_admin(self, tmp_path):
+    def test_no_admin_warning_when_admin(self, tmp_path, monkeypatch):
         """When process IS admin, no admin warning should be emitted for power module.
 
         Validates: Requirement 6.1 (inverse case)
@@ -346,36 +306,20 @@ class TestExportWorkerAdminWarning:
         worker = ExportWorker(config, bridge)
         collected = _collect_signals(worker)
 
-        snapshot_dir = tmp_path / "test_snapshot"
-        snapshot_dir.mkdir()
+        monkeypatch.setattr(
+            power_module, "export",
+            lambda d: {"enabled": True, "plan": "balanced"},
+        )
+        monkeypatch.setattr(worker, "_is_admin", lambda: True)
 
-        zip_path = tmp_path / "test_snapshot.winsnap"
-
-        def fake_zip_snapshot(sdir):
-            with zipfile.ZipFile(zip_path, "w") as zf:
-                for f in sdir.rglob("*"):
-                    if f.is_file():
-                        zf.write(f, f.relative_to(sdir.parent))
-            return zip_path
-
-        fake_power = MagicMock()
-        fake_power.export = MagicMock(return_value={"enabled": True, "plan": "balanced"})
-
-        with patch("export.create_snapshot_dir", return_value=snapshot_dir), \
-             patch("export.zip_snapshot", side_effect=fake_zip_snapshot), \
-             patch("importlib.import_module") as mock_import, \
-             patch.object(worker, "_is_admin", return_value=True):
-
-            mock_import.return_value = fake_power
-
-            worker.run()
+        worker.run()
 
         # No admin-related warning should be emitted
         admin_warnings = [msg for msg, sev in collected["logs"]
                           if sev == Severity.WARNING and "administrator" in msg.lower()]
         assert len(admin_warnings) == 0, "No admin warning expected when running as admin"
 
-    def test_no_admin_warning_when_power_not_selected(self, tmp_path):
+    def test_no_admin_warning_when_power_not_selected(self, tmp_path, monkeypatch):
         """When power is NOT in the selected modules, no admin warning should be emitted.
 
         Validates: Requirement 6.1 (power not selected case)
@@ -385,29 +329,10 @@ class TestExportWorkerAdminWarning:
         worker = ExportWorker(config, bridge)
         collected = _collect_signals(worker)
 
-        snapshot_dir = tmp_path / "test_snapshot"
-        snapshot_dir.mkdir()
+        monkeypatch.setattr(wallpaper_module, "export", lambda d: {"enabled": True})
+        monkeypatch.setattr(worker, "_is_admin", lambda: False)
 
-        zip_path = tmp_path / "test_snapshot.winsnap"
-
-        def fake_zip_snapshot(sdir):
-            with zipfile.ZipFile(zip_path, "w") as zf:
-                for f in sdir.rglob("*"):
-                    if f.is_file():
-                        zf.write(f, f.relative_to(sdir.parent))
-            return zip_path
-
-        fake_wallpaper = MagicMock()
-        fake_wallpaper.export = MagicMock(return_value={"enabled": True})
-
-        with patch("export.create_snapshot_dir", return_value=snapshot_dir), \
-             patch("export.zip_snapshot", side_effect=fake_zip_snapshot), \
-             patch("importlib.import_module") as mock_import, \
-             patch.object(worker, "_is_admin", return_value=False):
-
-            mock_import.return_value = fake_wallpaper
-
-            worker.run()
+        worker.run()
 
         # No admin-related warning should be emitted
         admin_warnings = [msg for msg, sev in collected["logs"]

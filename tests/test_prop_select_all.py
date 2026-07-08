@@ -3,6 +3,11 @@ test_prop_select_all.py — Property-based test for select-all / deselect-all co
 
 Feature: winsnap-gui, Property 4: Select-all / deselect-all coverage
 
+gui.py's hardcoded MODULES_EXPORT_ORDER constant was removed (Task 3.6); the
+module selector's full module list is now derived from
+modules.manifest.MODULE_NAMES, the single canonical source of module names
+and ordering (Req 5.1).
+
 Validates: Requirements 3.6, 3.7
 """
 
@@ -14,7 +19,9 @@ from hypothesis import strategies as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from gui import resolve_run_modules, MODULES_EXPORT_ORDER
+from modules import manifest
+
+from gui import resolve_run_modules
 
 
 @given(starting_state=st.lists(st.booleans(), min_size=13, max_size=13))
@@ -28,7 +35,7 @@ def test_select_all_deselect_all_coverage(starting_state: list[bool]):
 
     **Validates: Requirements 3.6, 3.7**
     """
-    all_modules = MODULES_EXPORT_ORDER
+    all_modules = manifest.MODULE_NAMES
 
     # Verify we have exactly 13 modules
     assert len(all_modules) == 13

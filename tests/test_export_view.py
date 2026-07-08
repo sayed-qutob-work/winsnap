@@ -17,7 +17,9 @@ from PyQt6.QtWidgets import QApplication, QCheckBox, QLabel, QLineEdit, QPushBut
 # Ensure a QApplication exists before any widget tests
 _app = QApplication.instance() or QApplication(sys.argv)
 
-from gui import ExportConfig, ExportView, ModuleSelector, MODULES_EXPORT_ORDER
+from modules import manifest
+
+from gui import ExportConfig, ExportView, ModuleSelector
 
 
 class TestExportViewDefaults:
@@ -63,7 +65,7 @@ class TestExportViewDefaults:
     def test_all_modules_selected_by_default(self):
         """All 13 modules should be selected by default (Req 3.4)."""
         view = ExportView()
-        assert view._module_selector.selected() == set(MODULES_EXPORT_ORDER)
+        assert view._module_selector.selected() == set(manifest.MODULE_NAMES)
 
 
 class TestExportViewBuildConfig:
@@ -82,7 +84,7 @@ class TestExportViewBuildConfig:
         assert config.output_dir == Path.home() / "Desktop"
         assert config.name is None
         assert config.show_all is False
-        assert config.selected_modules == set(MODULES_EXPORT_ORDER)
+        assert config.selected_modules == set(manifest.MODULE_NAMES)
 
     def test_build_config_with_name(self):
         """build_config() should capture the snapshot name when provided."""
