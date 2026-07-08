@@ -99,12 +99,127 @@ def resolve_output_path(output: Path, name: str, force: bool) -> Path:
     return target_dir
 
 
+def resolve_snapshot_dir(output: Path, name: str | None, force: bool) -> Path:
+    """
+    Decide where an export writes to, and prepare that directory.
+
+    Encapsulates main()'s "where does this export write to" branch as a
+    single importable decision (gui-backend-alignment Req 9.1, 9.4, 10.1): a
+    named export (`name` truthy) delegates to resolve_output_path for
+    collision handling -- raising FileExistsError, BEFORE any module has
+    run, when the destination collides and force=False, or deleting the
+    colliding path(s) and returning a fresh directory when force=True. An
+    unnamed export delegates to create_snapshot_dir's timestamp naming,
+    which never collides.
+
+    This is the single place either decision is made, so a GUI export and a
+    CLI export can never diverge on where a snapshot folder ends up.
+    """
+    if name:
+        target = resolve_output_path(output, name, force)
+        output.mkdir(parents=True, exist_ok=True)
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    return create_snapshot_dir(output)
+
+
 def zip_snapshot(snapshot_dir: Path) -> Path:
     zip_path = snapshot_dir.parent / (snapshot_dir.name + ".winsnap")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for file in snapshot_dir.rglob("*"):
             zf.write(file, file.relative_to(snapshot_dir.parent))
     return zip_path
+
+
+def build_snapshot_metadata(modules_attempted: list) -> dict:
+    """
+    Build the snapshot.json metadata dict — the exact same keys, values,
+    and insertion order as main()'s inline `snapshot = {...}` literal, with
+    `modules_attempted` supplied by the caller instead of assigned onto the
+    dict after the fact.
+
+    Extracted so a GUI export and a CLI export construct snapshot metadata
+    through the same code path and can never structurally drift (single
+    source of truth, gui-backend-alignment Req 10.1, 10.2). `modules` starts
+    empty; callers populate it with per-module export results after running
+    modules (matching main()'s existing pattern of running modules before
+    writing snapshot.json).
+    """
+    return {
+        "winsnap_version":         SNAPSHOT_FORMAT_VERSION,
+        "snapshot_format_version": SNAPSHOT_FORMAT_VERSION,
+        "exported_at":             datetime.now().isoformat(),
+        "exported_on": {
+            "user":    os.environ.get("USERNAME", ""),
+            "machine": os.environ.get("COMPUTERNAME", ""),
+        },
+        "modules": {},
+        "modules_attempted": modules_attempted,
+    }
+
+
+def write_snapshot_json(snapshot_dir: Path, snapshot: dict) -> Path:
+    """
+    Write `snapshot` to `snapshot_dir/snapshot.json` as pretty-printed,
+    UTF-8 JSON.
+
+    Extracted from main()'s inline `json_path.write_text(...)` call
+    (gui-backend-alignment Req 10.1) so a GUI export and a CLI export write
+    snapshot.json through the exact same code path.
+    """
+    json_path = snapshot_dir / "snapshot.json"
+    json_path.write_text(
+        json.dumps(snapshot, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+    return json_path
+
+
+def cleanup_snapshot_dir(snapshot_dir: Path) -> None:
+    """
+    Remove the unzipped snapshot folder after it has been zipped, retrying
+    with the read-only flag cleared on Windows permission errors.
+
+    Extracted from main()'s post-zip cleanup block (gui-backend-alignment
+    Req 10.1) so a GUI export and a CLI export clean up temp folders through
+    the exact same code path. Never raises -- a cleanup failure is reported
+    to stdout and left for the user to delete manually, matching main()'s
+    existing behavior.
+    """
+    def _force_remove(func, path, _):
+        """If rmtree hits a permission error, chmod and retry."""
+        import stat
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    try:
+        shutil.rmtree(snapshot_dir, onexc=_force_remove)
+    except Exception as e:
+        print(f"[export] Note: could not fully clean up temp folder: {e}")
+        print(f"[export] You can safely delete it manually: {snapshot_dir}")
+
+
+def run_export_modules(modules_to_run: list, snapshot_dir: Path) -> dict:
+    """
+    Run every (name, fn) pair in `modules_to_run` against `snapshot_dir` and
+    collect the per-module results.
+
+    Extracted from main()'s module-running loop (gui-backend-alignment Req
+    10.1, 10.3) so a GUI export and a CLI export execute modules through the
+    exact same code path. A module raising is recorded as
+    `{"error": str(e)}` and the loop continues -- a single module's failure
+    never aborts the rest of the batch, matching main()'s existing
+    try/except-per-module behavior.
+    """
+    results: dict = {}
+    for name, fn in modules_to_run:
+        print(f"\n[{name}] Running...")
+        try:
+            results[name] = fn(snapshot_dir)
+        except Exception as e:
+            print(f"[{name}] ERROR: {e}")
+            results[name] = {"error": str(e)}
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -216,34 +331,19 @@ def main():
 
     # Create working directory. When --name is given, resolve any collision
     # with a pre-existing snapshot folder/.winsnap file BEFORE running any
-    # module (Req 13.3) -- this replaces the old bare
-    # `snapshot_dir.rename(named)`, which crashed with an unhelpful OSError
-    # whenever the destination already existed.
-    if args.name:
-        try:
-            named = resolve_output_path(args.output, args.name, args.force)
-        except FileExistsError as e:
-            print(f"\n[export] ERROR: {e}")
-            sys.exit(1)
-        args.output.mkdir(parents=True, exist_ok=True)
-        named.mkdir(parents=True, exist_ok=True)
-        snapshot_dir = named
-    else:
-        snapshot_dir = create_snapshot_dir(args.output)
+    # module (Req 13.3) via resolve_snapshot_dir -- this replaces the old
+    # bare `snapshot_dir.rename(named)`, which crashed with an unhelpful
+    # OSError whenever the destination already existed.
+    try:
+        snapshot_dir = resolve_snapshot_dir(args.output, args.name, args.force)
+    except FileExistsError as e:
+        print(f"\n[export] ERROR: {e}")
+        sys.exit(1)
     print(f"\nSnapshot folder: {snapshot_dir}\n")
 
-    snapshot = {
-        "winsnap_version":         SNAPSHOT_FORMAT_VERSION,
-        "snapshot_format_version": SNAPSHOT_FORMAT_VERSION,
-        "exported_at":             datetime.now().isoformat(),
-        "exported_on": {
-            "user":    os.environ.get("USERNAME", ""),
-            "machine": os.environ.get("COMPUTERNAME", ""),
-        },
-        "modules": {},
-    }
-
-    # --- Resolve which modules to run ---
+    # --- Resolve which modules to run (before metadata construction, so
+    # modules_attempted can be passed straight into build_snapshot_metadata
+    # instead of assigned onto the dict after the fact) ---
     all_modules = _build_modules(args)
     skip = set(args.skip)
     only = set(args.only)
@@ -251,43 +351,24 @@ def main():
         (name, fn) for name, fn in all_modules
         if (not only or name in only) and name not in skip
     ]
-    snapshot["modules_attempted"] = [name for name, _ in modules_to_run]
+    modules_attempted = [name for name, _ in modules_to_run]
 
-    print(f"Modules to export: {', '.join(snapshot['modules_attempted'])}")
+    print(f"Modules to export: {', '.join(modules_attempted)}")
 
     # --- Run each module ---
-    for name, fn in modules_to_run:
-        print(f"\n[{name}] Running...")
-        try:
-            result = fn(snapshot_dir)
-            snapshot["modules"][name] = result
-        except Exception as e:
-            print(f"[{name}] ERROR: {e}")
-            snapshot["modules"][name] = {"error": str(e)}
+    results = run_export_modules(modules_to_run, snapshot_dir)
 
-    # --- Write snapshot.json ---
-    json_path = snapshot_dir / "snapshot.json"
-    json_path.write_text(
-        json.dumps(snapshot, indent=2, ensure_ascii=False),
-        encoding="utf-8"
-    )
+    # --- Build metadata and write snapshot.json ---
+    snapshot = build_snapshot_metadata(modules_attempted)
+    snapshot["modules"] = results
+    write_snapshot_json(snapshot_dir, snapshot)
     print(f"\n[export] snapshot.json written.")
 
     # --- Zip it up ---
     zip_path = zip_snapshot(snapshot_dir)
 
     # Clean up the unzipped folder — force-clear read-only flags on Windows
-    def _force_remove(func, path, _):
-        """If rmtree hits a permission error, chmod and retry."""
-        import stat
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
-
-    try:
-        shutil.rmtree(snapshot_dir, onexc=_force_remove)
-    except Exception as e:
-        print(f"[export] Note: could not fully clean up temp folder: {e}")
-        print(f"[export] You can safely delete it manually: {snapshot_dir}")
+    cleanup_snapshot_dir(snapshot_dir)
     print(f"\n{'='*55}")
     print(f"  Done! Snapshot saved to:")
     print(f"  {zip_path}")

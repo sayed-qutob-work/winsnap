@@ -29,6 +29,7 @@ point, covering export.py's argument parsing and orchestration directly:
 """
 
 import json
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -399,3 +400,280 @@ def test_resolve_output_path_force_overwrites_existing_dir_and_zip(tmp_path):
     assert result == tmp_path / "taken"
     assert not result.exists()
     assert not (tmp_path / "taken.winsnap").exists()
+
+
+# ---------------------------------------------------------------------------
+# build_snapshot_metadata (gui-backend-alignment Task 2.1): the metadata dict
+# must have the exact same keys, values, and insertion order as main()'s
+# pre-refactor inline `snapshot = {...}` literal (Req 10.1, 10.2), so a GUI
+# export and a CLI export cannot structurally drift.
+# ---------------------------------------------------------------------------
+
+def test_build_snapshot_metadata_key_set_and_order_match_pre_refactor_literal():
+    modules_attempted = ["wallpaper", "taskbar", "apps"]
+
+    snapshot = export.build_snapshot_metadata(modules_attempted)
+
+    assert list(snapshot.keys()) == [
+        "winsnap_version",
+        "snapshot_format_version",
+        "exported_at",
+        "exported_on",
+        "modules",
+        "modules_attempted",
+    ]
+
+
+def test_build_snapshot_metadata_field_values():
+    modules_attempted = ["wallpaper", "apps"]
+
+    snapshot = export.build_snapshot_metadata(modules_attempted)
+
+    assert snapshot["winsnap_version"] == export.SNAPSHOT_FORMAT_VERSION
+    assert snapshot["snapshot_format_version"] == export.SNAPSHOT_FORMAT_VERSION
+    assert snapshot["modules"] == {}
+    assert snapshot["modules_attempted"] == modules_attempted
+    assert "exported_on" in snapshot
+    assert set(snapshot["exported_on"].keys()) == {"user", "machine"}
+    # exported_at is an ISO-format timestamp produced at call time.
+    from datetime import datetime as _dt
+    _dt.fromisoformat(snapshot["exported_at"])
+
+
+def test_build_snapshot_metadata_empty_modules_attempted():
+    snapshot = export.build_snapshot_metadata([])
+
+    assert snapshot["modules_attempted"] == []
+    assert snapshot["modules"] == {}
+
+
+def test_build_snapshot_metadata_stores_input_list_by_reference():
+    modules_attempted = ["wallpaper", "taskbar"]
+    original = list(modules_attempted)
+
+    snapshot = export.build_snapshot_metadata(modules_attempted)
+    snapshot["modules_attempted"].append("mutated")
+
+    # build_snapshot_metadata stores the caller's list by reference (matching
+    # main()'s current behavior of assigning the same list object onto the
+    # snapshot dict), so mutating the returned dict's list is visible on the
+    # caller's original list too. This documents that identity, not a copy.
+    assert modules_attempted == original + ["mutated"]
+
+
+# ---------------------------------------------------------------------------
+# resolve_snapshot_dir (gui-backend-alignment Task 2.2): the single place
+# that decides "where does this export write to" -- a named export goes
+# through resolve_output_path's collision handling; an unnamed export uses
+# create_snapshot_dir's timestamp naming. Req 9.1, 9.4, 10.1.
+# ---------------------------------------------------------------------------
+
+def test_resolve_snapshot_dir_unnamed_uses_create_snapshot_dir(tmp_path):
+    result = export.resolve_snapshot_dir(tmp_path, None, force=False)
+
+    # create_snapshot_dir names folders "winsnap_<timestamp>" under output.
+    assert result.parent == tmp_path
+    assert result.name.startswith("winsnap_")
+    assert result.exists()
+
+
+def test_resolve_snapshot_dir_empty_string_name_uses_create_snapshot_dir(tmp_path):
+    # An empty string is falsy, same as None -- matches main()'s `if
+    # args.name:` truthiness check.
+    result = export.resolve_snapshot_dir(tmp_path, "", force=False)
+
+    assert result.parent == tmp_path
+    assert result.name.startswith("winsnap_")
+
+
+def test_resolve_snapshot_dir_named_no_collision_creates_target(tmp_path):
+    result = export.resolve_snapshot_dir(tmp_path, "fresh_name", force=False)
+
+    assert result == tmp_path / "fresh_name"
+    assert result.exists()
+    assert result.is_dir()
+
+
+def test_resolve_snapshot_dir_named_collision_no_force_raises(tmp_path):
+    (tmp_path / "taken").mkdir()
+
+    with pytest.raises(FileExistsError) as exc_info:
+        export.resolve_snapshot_dir(tmp_path, "taken", force=False)
+
+    assert str(tmp_path / "taken") in str(exc_info.value)
+
+
+def test_resolve_snapshot_dir_named_collision_force_deletes_and_recreates(tmp_path):
+    existing = tmp_path / "taken"
+    existing.mkdir()
+    (existing / "leftover.txt").write_text("old", encoding="utf-8")
+    (tmp_path / "taken.winsnap").write_text("old archive", encoding="utf-8")
+
+    result = export.resolve_snapshot_dir(tmp_path, "taken", force=True)
+
+    assert result == tmp_path / "taken"
+    assert result.exists()
+    assert result.is_dir()
+    # The stale leftover file is gone -- resolve_output_path deleted the
+    # whole colliding directory before resolve_snapshot_dir recreated it.
+    assert not (result / "leftover.txt").exists()
+    assert not (tmp_path / "taken.winsnap").exists()
+
+
+def test_resolve_snapshot_dir_named_creates_output_dir_if_missing(tmp_path):
+    output = tmp_path / "does_not_exist_yet"
+
+    result = export.resolve_snapshot_dir(output, "name", force=False)
+
+    assert output.exists()
+    assert result == output / "name"
+    assert result.exists()
+
+
+# ---------------------------------------------------------------------------
+# run_export_modules (gui-backend-alignment Task 2.3): the exact loop body of
+# main()'s module-running section, extracted for reuse by the GUI export path
+# (Req 10.1, 10.3). A module raising must be recorded as {"error": str(e)}
+# and the batch must continue running the remaining modules.
+# ---------------------------------------------------------------------------
+
+def test_run_export_modules_returns_per_module_results(tmp_path):
+    calls = []
+
+    def fn_a(snapshot_dir):
+        calls.append(("a", snapshot_dir))
+        return {"value": 1}
+
+    def fn_b(snapshot_dir):
+        calls.append(("b", snapshot_dir))
+        return {"value": 2}
+
+    results = export.run_export_modules(
+        [("a", fn_a), ("b", fn_b)], tmp_path
+    )
+
+    assert results == {"a": {"value": 1}, "b": {"value": 2}}
+    assert calls == [("a", tmp_path), ("b", tmp_path)]
+
+
+def test_run_export_modules_one_module_raising_does_not_stop_the_rest(tmp_path):
+    calls = []
+
+    def fn_ok_first(snapshot_dir):
+        calls.append("ok_first")
+        return {"value": 1}
+
+    def fn_raises(snapshot_dir):
+        calls.append("raises")
+        raise RuntimeError("boom")
+
+    def fn_ok_after(snapshot_dir):
+        calls.append("ok_after")
+        return {"value": 3}
+
+    results = export.run_export_modules(
+        [("ok_first", fn_ok_first), ("broken", fn_raises), ("ok_after", fn_ok_after)],
+        tmp_path,
+    )
+
+    assert calls == ["ok_first", "raises", "ok_after"]
+    assert results["ok_first"] == {"value": 1}
+    assert results["broken"] == {"error": "boom"}
+    assert results["ok_after"] == {"value": 3}
+
+
+def test_run_export_modules_empty_list_returns_empty_dict(tmp_path):
+    assert export.run_export_modules([], tmp_path) == {}
+
+
+def test_run_export_modules_prints_identical_lines_to_pre_refactor_inline_loop(tmp_path, capsys):
+    def fn_ok(snapshot_dir):
+        return {"value": 1}
+
+    def fn_raises(snapshot_dir):
+        raise RuntimeError("boom")
+
+    export.run_export_modules(
+        [("wallpaper", fn_ok), ("taskbar", fn_raises)], tmp_path
+    )
+
+    captured = capsys.readouterr()
+    # Matches the pre-refactor inline loop's print() calls exactly:
+    #   print(f"\n[{name}] Running...")
+    #   print(f"[{name}] ERROR: {e}")   (only on raise)
+    assert captured.out == (
+        "\n[wallpaper] Running...\n"
+        "\n[taskbar] Running...\n"
+        "[taskbar] ERROR: boom\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# write_snapshot_json / cleanup_snapshot_dir (gui-backend-alignment Task 2.4):
+# extracted from main()'s inline snapshot.json write and post-zip chmod-retry
+# rmtree cleanup, so a GUI export and a CLI export write/clean up through the
+# exact same code path. Req 10.1.
+# ---------------------------------------------------------------------------
+
+def test_write_snapshot_json_writes_pretty_printed_utf8_json(tmp_path):
+    snapshot = export.build_snapshot_metadata(["wallpaper", "apps"])
+
+    json_path = export.write_snapshot_json(tmp_path, snapshot)
+
+    assert json_path == tmp_path / "snapshot.json"
+    assert json_path.exists()
+    on_disk = json.loads(json_path.read_text(encoding="utf-8"))
+    assert on_disk == snapshot
+    # Pretty-printed with indent=2, matching main()'s pre-refactor call.
+    assert "\n  " in json_path.read_text(encoding="utf-8")
+
+
+def test_write_snapshot_json_preserves_non_ascii_characters(tmp_path):
+    snapshot = {"note": "unicode: ✓ → café"}
+
+    json_path = export.write_snapshot_json(tmp_path, snapshot)
+
+    text = json_path.read_text(encoding="utf-8")
+    assert "✓" in text
+    assert "café" in text
+
+
+def test_write_snapshot_json_returns_path_to_snapshot_json(tmp_path):
+    result = export.write_snapshot_json(tmp_path, {"a": 1})
+    assert result == tmp_path / "snapshot.json"
+
+
+def test_cleanup_snapshot_dir_removes_the_directory(tmp_path):
+    snapshot_dir = tmp_path / "winsnap_test"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "file.txt").write_text("data", encoding="utf-8")
+
+    export.cleanup_snapshot_dir(snapshot_dir)
+
+    assert not snapshot_dir.exists()
+
+
+def test_cleanup_snapshot_dir_removes_read_only_files(tmp_path):
+    import stat
+
+    snapshot_dir = tmp_path / "winsnap_readonly"
+    snapshot_dir.mkdir()
+    ro_file = snapshot_dir / "readonly.txt"
+    ro_file.write_text("data", encoding="utf-8")
+    os.chmod(ro_file, stat.S_IREAD)
+
+    export.cleanup_snapshot_dir(snapshot_dir)
+
+    assert not snapshot_dir.exists()
+
+
+def test_cleanup_snapshot_dir_missing_dir_reports_and_does_not_raise(tmp_path, capsys):
+    missing = tmp_path / "does_not_exist"
+
+    # Must not raise -- a cleanup failure is reported to stdout and left for
+    # the user to delete manually, matching main()'s pre-refactor behavior.
+    export.cleanup_snapshot_dir(missing)
+
+    captured = capsys.readouterr()
+    assert "could not fully clean up temp folder" in captured.out
+    assert str(missing) in captured.out

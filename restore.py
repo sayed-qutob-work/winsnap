@@ -31,6 +31,7 @@ import shutil
 import sys
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 # Force UTF-8 stdout/stderr so unicode in our messages doesn't crash on
@@ -141,23 +142,89 @@ ALL_MODULES = [
 ]
 
 
-def _check_format_version(snapshot: dict) -> bool:
-    """Return True if we can safely restore this snapshot."""
+@dataclass(frozen=True)
+class VersionEvaluation:
+    """Pure result of evaluating a snapshot's format version (Req 7.1):
+    verdict is one of "compatible" | "incompatible" | "unparseable"; raw is
+    the version value after the fallback chain, kept in its ORIGINAL type
+    (not stringified) so callers that need repr-parity with the pre-refactor
+    diagnostic message can get it; major is the parsed MAJOR component, or
+    None when unparseable."""
+    verdict: str
+    raw: object
+    major: int | None
+
+
+def evaluate_snapshot_version(snapshot: dict) -> VersionEvaluation:
+    """Pure, print-free version-acceptance decision -- single source of
+    truth for restore.py's own _check_format_version (Task 1.2) and for the
+    GUI (Req 7.1, 7.2, 7.3). Fallback chain and MAJOR-parsing logic are
+    identical to the pre-refactor _check_format_version: try
+    snapshot_format_version, then winsnap_version, then "0.1.0"; a MAJOR
+    greater than SUPPORTED_MAJOR is incompatible; anything that cannot be
+    parsed as int(str(raw).split(".")[0]) is unparseable."""
     raw = (snapshot.get("snapshot_format_version")
            or snapshot.get("winsnap_version")
            or "0.1.0")
     try:
         major = int(str(raw).split(".")[0])
     except (ValueError, IndexError):
-        print(f"  WARNING: unrecognized version format {raw!r}, "
-              f"attempting restore anyway.")
-        return True
+        return VersionEvaluation("unparseable", raw, None)
 
     if major > SUPPORTED_MAJOR:
-        print(f"  ERROR: snapshot format v{raw} is newer than this restorer "
+        return VersionEvaluation("incompatible", raw, major)
+    return VersionEvaluation("compatible", raw, major)
+
+
+def _check_format_version(snapshot: dict) -> bool:
+    """Return True if we can safely restore this snapshot.
+
+    Thin wrapper over evaluate_snapshot_version (Req 7.3, 11.1): the
+    fallback chain and MAJOR-parsing logic now live in one place
+    (evaluate_snapshot_version), and this function only reproduces the two
+    diagnostic print lines and boolean return the CLI has always printed --
+    byte-identical to the pre-refactor inline implementation, including the
+    {raw!r} warning line for non-string raw values (see
+    VersionEvaluation.raw's docstring for why raw is kept unstringified)."""
+    ev = evaluate_snapshot_version(snapshot)
+    if ev.verdict == "unparseable":
+        print(f"  WARNING: unrecognized version format {ev.raw!r}, "
+              f"attempting restore anyway.")
+        return True
+    if ev.verdict == "incompatible":
+        print(f"  ERROR: snapshot format v{ev.raw} is newer than this restorer "
               f"supports (v{SUPPORTED_MAJOR}.x). Update WinSnap and try again.")
         return False
     return True
+
+
+def partition_modules(modules_to_run: list, modules_data: dict) -> tuple:
+    """
+    Pure classification of `modules_to_run` into (attemptable, skipped),
+    where `skipped` maps key -> reason code ("not_found_in_snapshot" |
+    "export_error") (Req 2.2, 2.6).
+
+    This mirrors the two-line membership check inline in run_modules's loop
+    (`key not in modules_data` / `"error" in data`) exactly, but is
+    deliberately NOT a shared call -- run_modules is already hardened and is
+    left untouched (see restore.py's module docstring / design notes). The
+    GUI (and run_dry_run) get their skip-row data from this function
+    instead of re-deriving the membership check themselves. A property-based
+    parity test guards this copy against ever drifting from run_modules's
+    inline check.
+    """
+    attemptable: list = []
+    skipped: dict = {}
+    for key, mod in modules_to_run:
+        if key not in modules_data:
+            skipped[key] = "not_found_in_snapshot"
+            continue
+        data = modules_data[key]
+        if isinstance(data, dict) and "error" in data:
+            skipped[key] = "export_error"
+            continue
+        attemptable.append((key, mod))
+    return attemptable, skipped
 
 
 def _summarize(key: str, data) -> str:
@@ -201,6 +268,47 @@ def _summarize(key: str, data) -> str:
     if isinstance(data, list):
         return f"would restore {len(data)} item(s)"
     return f"would restore: {data!r}"
+
+
+# Wording matches, verbatim, the skip messages main()'s pre-refactor
+# --dry-run loop printed inline for each partition_modules reason code (Req
+# 8.8, 11.1) -- see tests/test_run_dry_run_golden.py for the captured
+# baseline this must keep matching.
+_DRY_RUN_SKIP_MESSAGES = {
+    "not_found_in_snapshot": "Not found in snapshot. Skipping.",
+    "export_error": "Was not captured (export error). Skipping.",
+}
+
+
+def run_dry_run(modules_to_run: list, modules_data: dict) -> dict:
+    """
+    Extracted verbatim from main()'s --dry-run loop (Req 2.6, 8.8): prints
+    the identical lines, in the identical order, reusing partition_modules
+    for the skip classification and the existing _summarize for the
+    per-module summary text. Additionally returns
+    {key: {"would_restore": bool, "summary": str | None,
+    "skip_reason": str | None}} so a structured caller (the GUI) does not
+    have to scrape stdout to know what would have happened (Req 2.6).
+    """
+    _, skipped = partition_modules(modules_to_run, modules_data)
+    result: dict = {}
+    for key, mod in modules_to_run:
+        if key in skipped:
+            print(f"[{key}] {_DRY_RUN_SKIP_MESSAGES[skipped[key]]}")
+            result[key] = {
+                "would_restore": False,
+                "summary": None,
+                "skip_reason": skipped[key],
+            }
+            continue
+        summary = _summarize(key, modules_data[key])
+        print(f"[{key}] {summary}")
+        result[key] = {
+            "would_restore": True,
+            "summary": summary,
+            "skip_reason": None,
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -452,15 +560,7 @@ def main():
 
     # --- Dry-run: summarize only, bypassing both restore and verify ---
     if args.dry_run:
-        for key, mod in modules_to_run:
-            if key not in modules_data:
-                print(f"[{key}] Not found in snapshot. Skipping.")
-                continue
-            data = modules_data[key]
-            if isinstance(data, dict) and "error" in data:
-                print(f"[{key}] Was not captured (export error). Skipping.")
-                continue
-            print(f"[{key}] {_summarize(key, data)}")
+        run_dry_run(modules_to_run, modules_data)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
         print(f"\n{'='*55}")

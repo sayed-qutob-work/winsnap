@@ -57,8 +57,15 @@ class Severity(enum.Enum):
 
 
 class ModuleStatus(enum.Enum):
-    """Outcome status for a module in the results summary."""
-    PASSED = "passed"
+    """Outcome status for a module row in the results summary.
+
+    Values are literally the modules/report.py status vocabulary
+    (``{"status": "matched"|"partial"|"failed"|"skipped"}``), so a report
+    dict's status can be turned into a ModuleStatus via a direct
+    ``ModuleStatus(report["status"])`` lookup with no translation table.
+    """
+    MATCHED = "matched"
+    PARTIAL = "partial"
     FAILED = "failed"
     SKIPPED = "skipped"
 
@@ -85,24 +92,43 @@ class LogEntry:
 
 @dataclass(frozen=True)
 class ModuleOutcome:
-    """The result of running (or skipping) a single module."""
+    """The result of running, verifying, or skipping a single module.
+
+    ``items`` carries a report dict's per-item list verbatim (plain dicts,
+    per modules/report.py's own "no dataclass" design) so the results view
+    can render per-item detail for partial/failed modules.
+    """
     name: str
     status: ModuleStatus
     detail: str | None
+    items: tuple[dict, ...] = ()
 
 
 @dataclass
 class ResultsSummary:
-    """Accumulates module outcomes and provides grouping/counting."""
+    """Accumulates restore/export outcomes and, separately, verify
+    outcomes, so a module can carry both a restore status and a verify
+    status without conflating the two."""
     outcomes: list[ModuleOutcome] = field(default_factory=list)
+    verify_outcomes: list[ModuleOutcome] = field(default_factory=list)
 
     def add(self, outcome: ModuleOutcome) -> None:
-        """Append an outcome to the summary."""
+        """Append a restore/export outcome to the summary."""
         self.outcomes.append(outcome)
 
-    def passed(self) -> list[ModuleOutcome]:
-        """Return all outcomes with PASSED status."""
-        return [o for o in self.outcomes if o.status == ModuleStatus.PASSED]
+    def add_verify(self, outcome: ModuleOutcome) -> None:
+        """Append a verify outcome to the summary, separate from
+        ``outcomes`` so a module's restore and verify results can be
+        rendered side by side."""
+        self.verify_outcomes.append(outcome)
+
+    def matched(self) -> list[ModuleOutcome]:
+        """Return all outcomes with MATCHED status."""
+        return [o for o in self.outcomes if o.status == ModuleStatus.MATCHED]
+
+    def partial(self) -> list[ModuleOutcome]:
+        """Return all outcomes with PARTIAL status."""
+        return [o for o in self.outcomes if o.status == ModuleStatus.PARTIAL]
 
     def failed(self) -> list[ModuleOutcome]:
         """Return all outcomes with FAILED status."""
@@ -112,9 +138,22 @@ class ResultsSummary:
         """Return all outcomes with SKIPPED status."""
         return [o for o in self.outcomes if o.status == ModuleStatus.SKIPPED]
 
-    def counts(self) -> tuple[int, int, int]:
-        """Return (passed_count, failed_count, skipped_count)."""
-        return (len(self.passed()), len(self.failed()), len(self.skipped()))
+    def counts(self) -> tuple[int, int, int, int]:
+        """Return (matched_count, partial_count, failed_count, skipped_count)."""
+        return (
+            len(self.matched()),
+            len(self.partial()),
+            len(self.failed()),
+            len(self.skipped()),
+        )
+
+    def verify_for(self, name: str) -> ModuleOutcome | None:
+        """Return the verify outcome for ``name``, or None if verification
+        did not run (or did not cover) that module."""
+        for outcome in self.verify_outcomes:
+            if outcome.name == name:
+                return outcome
+        return None
 
 
 @dataclass
@@ -124,6 +163,7 @@ class ExportConfig:
     name: str | None
     show_all: bool
     selected_modules: set[str]
+    force: bool = False        # set by MainWindow on overwrite confirmation
 
 
 @dataclass
@@ -132,6 +172,7 @@ class RestoreConfig:
     snapshot_path: Path
     dry_run: bool
     selected_modules: set[str]
+    verify: bool = False       # defaults to off, matching the CLI's --verify default
 
 
 # ---------------------------------------------------------------------------
@@ -168,28 +209,29 @@ def format_log_line(entry: LogEntry) -> str:
 # Pure functions — version evaluation
 # ---------------------------------------------------------------------------
 
+# Mirrors restore.VersionEvaluation.verdict's three string values, so
+# to_version_verdict is a direct lookup rather than a hand-maintained
+# translation table.
+_VERSION_VERDICT_MAP: dict[str, VersionVerdict] = {
+    "compatible": VersionVerdict.COMPATIBLE,
+    "incompatible": VersionVerdict.INCOMPATIBLE,
+    "unparseable": VersionVerdict.UNPARSEABLE,
+}
 
-def evaluate_version(
-    raw: str | None, supported_major: int
-) -> tuple[VersionVerdict, int | None]:
-    """Evaluate a snapshot format version string against the supported MAJOR.
 
-    Returns a (verdict, parsed_major) tuple:
-      - (UNPARSEABLE, None) when raw is None/empty or cannot be parsed
-      - (INCOMPATIBLE, major) when parsed MAJOR > supported_major
-      - (COMPATIBLE, major) when parsed MAJOR <= supported_major
+def to_version_verdict(evaluation) -> VersionVerdict:
+    """Pure mapping from a ``restore.VersionEvaluation`` to the GUI's
+    presentation-only ``VersionVerdict`` enum.
 
-    Consistent with restore._check_format_version logic.
+    ``evaluation`` is (and is only ever, in practice) a
+    ``restore.VersionEvaluation`` -- the single source of truth for the
+    version-acceptance decision (Req 7.1, 7.2, 7.3). This function accepts
+    any object exposing a ``.verdict`` attribute rather than importing
+    ``restore`` at module scope, consistent with gui.py's existing pattern
+    of importing ``restore``/``export``/``modules.checklist`` lazily inside
+    worker methods rather than at import time.
     """
-    if not raw:
-        return (VersionVerdict.UNPARSEABLE, None)
-    try:
-        major = int(str(raw).split(".")[0])
-    except (ValueError, IndexError):
-        return (VersionVerdict.UNPARSEABLE, None)
-    if major > supported_major:
-        return (VersionVerdict.INCOMPATIBLE, major)
-    return (VersionVerdict.COMPATIBLE, major)
+    return _VERSION_VERDICT_MAP[evaluation.verdict]
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +289,7 @@ def classify_export_outcome(
       message about Administrator privileges being required.
     - If the result dict has an "error" key or any other skip_reason →
       FAILED with the reported message.
-    - Otherwise (including {"enabled": false} or empty data) → PASSED.
+    - Otherwise (including {"enabled": false} or empty data) → MATCHED.
     """
     if raised is not None:
         return ModuleOutcome(name=name, status=ModuleStatus.FAILED, detail=str(raised))
@@ -269,44 +311,50 @@ def classify_export_outcome(
                 name=name, status=ModuleStatus.FAILED, detail=str(result["error"])
             )
 
-    return ModuleOutcome(name=name, status=ModuleStatus.PASSED, detail=None)
+    return ModuleOutcome(name=name, status=ModuleStatus.MATCHED, detail=None)
 
 
-def classify_restore_outcome(
-    name: str,
-    *,
-    selected: bool,
-    present: bool,
-    export_errored: bool,
-    raised: Exception | None,
-) -> ModuleOutcome:
-    """Classify the outcome of a module during a restore operation.
+def report_to_outcome(name: str, report: dict) -> ModuleOutcome:
+    """Pure mapping from a restore/verify report dict (modules/report.py's
+    locked ``{status, reason, items, ...}`` contract) to a ModuleOutcome.
 
-    Classification rules (evaluated in order):
-    - If the module was not selected → SKIPPED ("Deselected by user").
-    - If selected but not present in the snapshot → SKIPPED ("Not present in snapshot").
-    - If selected but recorded with an export error → SKIPPED ("Was not captured (export error)").
-    - If the module ran and raised an exception → FAILED with the exception text.
-    - Otherwise (ran or dry-run summarized without error) → PASSED.
+    ModuleStatus's values are literally the report's status strings
+    (``"matched"``/``"partial"``/``"failed"``/``"skipped"``), so this is a
+    direct lookup, not a hand-maintained translation table -- it cannot
+    raise for any status string ``modules.report.aggregate_status`` can
+    produce.
     """
-    if not selected:
-        return ModuleOutcome(
-            name=name, status=ModuleStatus.SKIPPED, detail="Deselected by user"
-        )
-    if not present:
-        return ModuleOutcome(
-            name=name, status=ModuleStatus.SKIPPED, detail="Not present in snapshot"
-        )
-    if export_errored:
-        return ModuleOutcome(
-            name=name,
-            status=ModuleStatus.SKIPPED,
-            detail="Was not captured (export error)",
-        )
-    if raised is not None:
-        return ModuleOutcome(name=name, status=ModuleStatus.FAILED, detail=str(raised))
+    return ModuleOutcome(
+        name=name,
+        status=ModuleStatus(report["status"]),
+        detail=report.get("reason"),
+        items=tuple(report.get("items", [])),
+    )
 
-    return ModuleOutcome(name=name, status=ModuleStatus.PASSED, detail=None)
+
+# Wording mirrors restore.py's own skip messages for these two reason codes
+# (see restore.py's run_modules loop and _DRY_RUN_SKIP_MESSAGES), so a
+# module skipped by the GUI reads the same as a module skipped by the CLI.
+_REPORT_SKIP_REASON_TEXT: dict[str, str] = {
+    "not_found_in_snapshot": "Not found in snapshot",
+    "export_error": "Was not captured (export error)",
+}
+
+
+def skip_outcome(name: str, reason_code: str) -> ModuleOutcome:
+    """Pure mapping from a skip reason code to a ModuleOutcome.
+
+    ``reason_code`` is either ``"deselected"`` (a GUI-only concept -- the
+    user did not select this module to run) or one of
+    ``restore.partition_modules``'s two codes (``"not_found_in_snapshot"``,
+    ``"export_error"``). All three map to ``ModuleStatus.SKIPPED``, with
+    wording matching the CLI's printed skip messages for the latter two.
+    """
+    if reason_code == "deselected":
+        return ModuleOutcome(name=name, status=ModuleStatus.SKIPPED, detail="Deselected by user")
+    return ModuleOutcome(
+        name=name, status=ModuleStatus.SKIPPED, detail=_REPORT_SKIP_REASON_TEXT[reason_code]
+    )
 
 
 # ---------------------------------------------------------------------------
