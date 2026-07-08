@@ -154,7 +154,7 @@
   - Write/update unit tests covering both the Yes and No confirmation paths.
   - _Requirements: 9.1, 9.2, 9.3_
 
-- [ ] 7. Rewrite existing tests broken by removed/reshaped functions and constants
+- [x] 7. Rewrite existing tests broken by removed/reshaped functions and constants
   - Depends on Tasks 3-6, since these tests assert on the pre-refactor API surface.
   - _Requirements: 11.6_
 
@@ -182,11 +182,11 @@
   - Move monkeypatch targets from ad hoc `zf.extractall`/loop internals to `restore.safe_extract`/`find_snapshot_dir`/`run_modules`/`run_verify`/`run_dry_run`/`partition_modules`.
   - _Requirements: 2.1, 2.2, 2.3, 4.1, 4.3, 11.6_
 
-- [ ] 7.7 Update `tests/test_export_worker.py` and `tests/test_export_view.py`
+- [x] 7.7 Update `tests/test_export_worker.py` and `tests/test_export_view.py`
   - Update for the collision/force flow, metadata-builder reuse, and removed `MODULES_EXPORT_ORDER` references.
   - _Requirements: 9.1, 9.2, 9.3, 10.2, 11.6_
 
-- [ ] 7.8 Update `tests/test_results_view.py` and `tests/test_prop_results_summary.py`
+- [x] 7.8 Update `tests/test_results_view.py` and `tests/test_prop_results_summary.py`
   - Update for four-status grouping, `verify_outcomes`, per-item detail, and the `passed()` → `matched()` rename.
   - _Requirements: 3.4, 8.1, 8.2, 8.4, 11.6_
 
