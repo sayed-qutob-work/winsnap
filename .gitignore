@@ -1,1 +1,32 @@
-Prompt
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Testing
+.pytest_cache/
+.pytest-tmp/
+.hypothesis/
+.coverage
+htmlcov/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+!winsnap-export.spec
+!winsnap-restore.spec
+
+# Snapshot artifacts produced by running the tool locally
+*.winsnap
+*.winsnap.zip
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local Claude Code settings (project-level settings.local.json is machine-specific)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

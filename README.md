@@ -1,8 +1,9 @@
-<<<<<<< HEAD
 # WinSnap 🪟
 
 Transfer your Windows personality — settings, wallpaper, fonts, apps — to any new PC.
 No bloatware. No viruses. Just your preferences.
+
+Use it from the command line, or through the PyQt6 desktop app.
 
 ---
 
@@ -27,24 +28,52 @@ No bloatware. No viruses. Just your preferences.
 | 🌐 Environment vars | User env vars; PATH is **merged**, not replaced |
 | 🌍 Region & keyboard | Locale, formats, keyboard layouts |
 
-The apps checklist now filters out OS components, updaters, runtimes, drivers,
+The apps checklist filters out OS components, updaters, runtimes, drivers,
 helpers, MSI patches, and KB updates by default — so you see ~the same list
 Windows shows in **Settings → Apps**, not 100+ noisy entries. Use `--show-all`
-to opt out of filtering.
+(CLI) to opt out of filtering.
 
 ---
 
 ## Requirements
 
 - Windows 10 or 11
-- Python 3.11+ (only on the export PC; the standalone `.exe` build needs no Python)
+- Python 3.11+ (only on the machine you run it from; the standalone `.exe`
+  build needs no Python)
 - `winget` (built into Windows 11, available for Win10 via App Installer)
+- `PyQt6` — only if you use the desktop app (`pip install PyQt6`)
 
-No third-party Python packages needed at runtime — stdlib only.
+The CLI tools (`export.py` / `restore.py`) need no third-party packages —
+stdlib only.
 
 ---
 
-## Usage
+## Desktop app
+
+```
+pip install PyQt6
+python gui.py
+```
+
+The app has two tabs — **Export** and **Restore** — each backed by the same
+module selector and the same backend functions the CLI uses, so behavior is
+identical either way. It adds a few things the CLI doesn't:
+
+- A live results view that groups each module's outcome as **Matched**,
+  **Partial**, **Failed**, or **Skipped**, with the reason and per-item
+  detail shown for anything that isn't a clean match.
+- A **Verify after restore** option that re-checks applied settings against
+  the snapshot and reports drift, without re-running restore.
+- A collision check before export: if a named snapshot would overwrite an
+  existing one, you're asked to confirm before anything runs.
+
+`gui.py` is a thin PyQt6 layer — all the actual export/restore/verify logic
+lives in `export.py`, `restore.py`, and `modules/`, so the GUI and CLI can
+never disagree about what happened.
+
+---
+
+## CLI usage
 
 ### On your OLD PC (export)
 
@@ -61,12 +90,14 @@ python export.py --name my_work_setup
 python export.py --skip fonts startup        # leave out heavy/risky modules
 python export.py --only wallpaper taskbar    # capture just these
 python export.py --show-all                  # don't filter the apps list
+python export.py --name my_setup --force     # overwrite an existing snapshot
 ```
 
 ### Transfer
 
 Copy the `.winsnap` file via USB, cloud, or network share to your new PC.
-Also copy `restore.py` and the `modules/` folder (or use the `.exe` build below).
+Also copy `restore.py`, `gui.py`, and the `modules/` folder (or use the
+`.exe` build below).
 
 ### On your NEW PC (restore)
 
@@ -90,7 +121,9 @@ python restore.py my_snapshot.winsnap --only wallpaper taskbar
 
 ## Building a standalone `.exe`
 
-The `.exe` build lets you run WinSnap on a target PC that has no Python.
+The `.exe` build lets you run the WinSnap CLI on a target PC that has no
+Python. (The desktop app currently runs from source via `python gui.py`
+and isn't packaged by `build.py`.)
 
 ```
 pip install pyinstaller
@@ -133,13 +166,17 @@ Current format version: **0.2.0**.
 
 ```
 winsnap/
-├── export.py              ← run on old PC
-├── restore.py             ← run on new PC
-├── build.py               ← PyInstaller build script
+├── export.py               ← CLI entry point (source PC)
+├── restore.py               ← CLI entry point (target PC)
+├── gui.py                   ← PyQt6 desktop app (Export/Restore tabs)
+├── build.py                  ← PyInstaller build script for the CLI tools
 ├── modules/
+│   ├── manifest.py           ← single source of truth for module order
+│   ├── report.py             ← shared matched/partial/failed/skipped report shape
+│   ├── winutil.py            ← shared Windows helpers (e.g. Explorer restart)
 │   ├── wallpaper.py
 │   ├── apps.py
-│   ├── checklist.py       ← interactive app picker (TUI)
+│   ├── checklist.py          ← interactive app picker (CLI TUI)
 │   ├── mouse_display.py
 │   ├── power.py
 │   ├── taskbar.py
@@ -151,20 +188,27 @@ winsnap/
 │   ├── startup.py
 │   ├── env_vars.py
 │   └── region_lang.py
-├── tests/
-│   └── smoke_apps.py      ← unit tests for the apps filter
+├── scripts/
+│   └── roundtrip_check.py    ← manual export→restore→verify sanity script
+├── tests/                    ← pytest + hypothesis suite (see Development)
 └── README.md
 ```
 
-Every settings module exposes the same two functions:
+Every settings module exposes the same contract:
 
 ```python
 def export(snapshot_dir: Path) -> dict
-def restore(snapshot: dict, snapshot_dir: Path) -> None
+def restore(snapshot: dict, snapshot_dir: Path) -> dict   # report: status/reason/items
+def verify(snapshot: dict, snapshot_dir: Path) -> dict    # same report shape
 ```
 
-Adding a new category = drop a new file in `modules/` matching this contract,
-and add it to the lists in `export.py` and `restore.py`.
+The `status` field is one of `matched`, `partial`, `failed`, or `skipped`
+(see `modules/report.py`) — both the CLI and the GUI classify outcomes from
+this field, never from whether the call happened to raise an exception.
+
+Adding a new category = drop a new file in `modules/` matching this contract
+and add its name to `modules/manifest.py`'s `MODULE_NAMES` — `export.py`,
+`restore.py`, and `gui.py` all derive their module lists from that one place.
 
 ---
 
@@ -180,8 +224,28 @@ and add it to the lists in `export.py` and `restore.py`.
 - **Startup entries are validated.** Run-key entries pointing at binaries that
   don't exist on the target are skipped with a warning, so we don't pollute
   the new PC with broken startup launches.
+- **Archives are extracted safely.** Restore rejects any snapshot whose zip
+  entries would write outside the extraction directory (zip-slip protection).
 - **No network calls** other than `winget`. WinSnap doesn't phone home.
-- **No third-party Python packages** at runtime — stdlib only.
+- **No third-party Python packages** at CLI runtime — stdlib only. The
+  desktop app is the one place that needs `PyQt6`.
+
+---
+
+## Development
+
+```
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q
+```
+
+The test suite is mock-heavy — it doesn't touch the real registry — and
+mixes plain `pytest` cases with `hypothesis` property-based tests. GUI-related
+tests need `PyQt6` installed and run headlessly via `QT_QPA_PLATFORM=offscreen`.
+
+This project follows a spec-driven workflow for non-trivial changes; see
+`CLAUDE.md` for how specs, requirements, design, and task documents fit
+together under `.claude/specs/`.
 
 ---
 
@@ -198,8 +262,9 @@ and add it to the lists in `export.py` and `restore.py`.
 - [x] Region & keyboard layouts
 - [x] Snapshot format versioning
 - [x] `--dry-run` for restore
-- [x] PyInstaller `.exe` build
-- [ ] GUI (PyQt6 checklist for app selection)
+- [x] PyInstaller `.exe` build (CLI)
+- [x] GUI (PyQt6 desktop app for export/restore, with verify support)
+- [ ] Package the GUI as a standalone `.exe`
 - [ ] Browser bookmarks / default browser
 - [ ] Pinned folders / Quick Access
 - [ ] Code signing for the `.exe` build (no more SmartScreen warning)
