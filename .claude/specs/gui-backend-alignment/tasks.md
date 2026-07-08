@@ -56,7 +56,7 @@
   - Run `tests/test_headless_export.py` and `tests/test_roundtrip_mocked.py` unmodified and confirm they still pass, as the acceptance bar for byte-identical CLI behavior.
   - _Requirements: 10.1, 10.2, 10.3, 11.1_
 
-- [ ] 3. Reshape `gui.py` data models and add report-mapping pure functions
+- [x] 3. Reshape `gui.py` data models and add report-mapping pure functions
   - Depends on Tasks 1-2 (consumes `restore.VersionEvaluation`/`evaluate_snapshot_version`/`partition_modules`, `export`'s new surfaces). All functions in this task are Qt-independent and unit-testable headless.
   - _Requirements: 1.5, 1.7, 3.3, 5.1, 7.3, 9.3, 11.3_
 
@@ -89,7 +89,7 @@
   - Write unit tests for the 3-way mapping.
   - _Requirements: 7.1, 7.2, 7.3, 11.3_
 
-- [ ] 3.6 Replace hardcoded module ordering with manifest-derived ordering
+- [x] 3.6 Replace hardcoded module ordering with manifest-derived ordering
   - Import `modules.manifest` at `gui.py` module scope.
   - Remove `MODULES_EXPORT_ORDER`, `MODULES_RESTORE_ORDER`, and `default_snapshot_name`.
   - Update every caller of `resolve_run_modules` to pass `manifest.MODULE_NAMES` as the order argument.

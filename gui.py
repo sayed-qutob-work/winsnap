@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from modules import manifest
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
@@ -235,45 +236,6 @@ def to_version_verdict(evaluation) -> VersionVerdict:
 
 
 # ---------------------------------------------------------------------------
-# Module ordering constants
-# ---------------------------------------------------------------------------
-
-# Mirrors the order in export.py's _build_modules()
-MODULES_EXPORT_ORDER: list[str] = [
-    "wallpaper",
-    "apps",
-    "mouse_display",
-    "power",
-    "taskbar",
-    "explorer",
-    "desktop_icons",
-    "sound_scheme",
-    "cursors",
-    "fonts",
-    "startup",
-    "env_vars",
-    "region_lang",
-]
-
-# Mirrors restore.py's ALL_MODULES order
-MODULES_RESTORE_ORDER: list[str] = [
-    "env_vars",
-    "region_lang",
-    "wallpaper",
-    "mouse_display",
-    "cursors",
-    "sound_scheme",
-    "power",
-    "explorer",
-    "desktop_icons",
-    "fonts",
-    "startup",
-    "taskbar",
-    "apps",
-]
-
-
-# ---------------------------------------------------------------------------
 # Outcome classification functions
 # ---------------------------------------------------------------------------
 
@@ -425,14 +387,6 @@ def validate_snapshot_name(name: str) -> str | None:
     return None
 
 
-def default_snapshot_name(start: datetime) -> str:
-    """Generate a default snapshot name from the export start time.
-
-    Produces a name in the format: winsnap_YYYYMMDD_HHMMSS
-    """
-    return "winsnap_" + start.strftime("%Y%m%d_%H%M%S")
-
-
 # ---------------------------------------------------------------------------
 # Pure functions — app-selection recording
 # ---------------------------------------------------------------------------
@@ -515,7 +469,7 @@ class ModuleSelector(QWidget):
         layout = QVBoxLayout(self)
 
         # Create a checkbox for each module, all checked by default
-        for module_name in MODULES_EXPORT_ORDER:
+        for module_name in manifest.MODULE_NAMES:
             cb = QCheckBox(module_name, self)
             cb.setChecked(True)
             self._checkboxes[module_name] = cb
@@ -1245,7 +1199,7 @@ class ExportWorker(QObject):
         try:
             # 1. Resolve run set
             run_modules = resolve_run_modules(
-                self._config.selected_modules, MODULES_EXPORT_ORDER
+                self._config.selected_modules, manifest.MODULE_NAMES
             )
 
             # 2. Admin check for power module
@@ -1510,7 +1464,7 @@ class RestoreWorker(QObject):
 
             # --- Resolve run set (Requirement 9.3) ---
             run_modules = resolve_run_modules(
-                self._config.selected_modules, MODULES_RESTORE_ORDER
+                self._config.selected_modules, manifest.MODULE_NAMES
             )
 
             # Build a lookup from module key to module object

@@ -21,10 +21,11 @@ from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog
 # Ensure a QApplication exists before any widget tests
 _app = QApplication.instance() or QApplication(sys.argv)
 
+from modules import manifest
+
 from gui import (
     AppSelectorDialog,
     ModuleSelector,
-    MODULES_EXPORT_ORDER,
     RestoreConfig,
     RestoreView,
 )
@@ -46,7 +47,7 @@ class TestModuleSelectorDefaults:
     def test_all_13_checked_by_default(self):
         """All 13 module checkboxes should be checked on creation (Req 3.4, 9.2)."""
         selector = ModuleSelector()
-        assert selector.selected() == set(MODULES_EXPORT_ORDER)
+        assert selector.selected() == set(manifest.MODULE_NAMES)
 
     def test_checkbox_labels_match_module_names(self):
         """Each checkbox label should match its module name."""
@@ -66,7 +67,7 @@ class TestModuleSelectorSelectAll:
         selector._checkboxes["apps"].setChecked(False)
         # Now select all
         selector.set_all(True)
-        assert selector.selected() == set(MODULES_EXPORT_ORDER)
+        assert selector.selected() == set(manifest.MODULE_NAMES)
 
     def test_set_all_false_deselects_all(self):
         """set_all(False) should uncheck all 13 modules (Req 3.7)."""
@@ -80,7 +81,7 @@ class TestModuleSelectorSelectAll:
         selector.set_all(False)
         assert selector.selected() == set()
         selector.set_all(True)
-        assert selector.selected() == set(MODULES_EXPORT_ORDER)
+        assert selector.selected() == set(manifest.MODULE_NAMES)
 
     def test_partial_selection(self):
         """Manually toggling checkboxes should reflect in selected()."""
@@ -117,7 +118,7 @@ class TestRestoreViewDefaults:
     def test_all_modules_selected_by_default(self):
         """All 13 modules should be selected by default (Req 9.2)."""
         view = RestoreView()
-        assert view._module_selector.selected() == set(MODULES_EXPORT_ORDER)
+        assert view._module_selector.selected() == set(manifest.MODULE_NAMES)
 
     def test_has_module_selector(self):
         """RestoreView should contain a ModuleSelector instance."""
@@ -131,7 +132,7 @@ class TestRestoreViewDefaults:
         assert isinstance(config, RestoreConfig)
         assert config.snapshot_path == Path("")
         assert config.dry_run is False
-        assert config.selected_modules == set(MODULES_EXPORT_ORDER)
+        assert config.selected_modules == set(manifest.MODULE_NAMES)
 
 
 # ---------------------------------------------------------------------------
