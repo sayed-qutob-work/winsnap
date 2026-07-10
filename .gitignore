@@ -30,3 +30,5 @@ Thumbs.db
 # Local Claude Code settings (project-level settings.local.json is machine-specific)
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+sandbox-tools
