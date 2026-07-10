@@ -114,7 +114,11 @@ def restore(snapshot: dict, snapshot_dir: Path) -> dict:
         return report.skip_all("requires elevation — run restore.py as Administrator")
 
     if not snapshot.get("enabled"):
-        return report.finalize()  # nothing captured -> skipped "nothing to restore"
+        reason = "no power plan in snapshot"
+        if snapshot.get("skip_reason") == "not_admin":
+            reason += " (export was not run as Administrator)"
+        print(f"[power] Skipped — {reason}.")
+        return report.skip_all(reason)
 
     pow_file = snapshot_dir / snapshot.get("filename", "power_plan.pow")
     if not pow_file.exists():

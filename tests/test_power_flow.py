@@ -85,6 +85,20 @@ def test_restore_nothing_to_restore_when_not_enabled(
     result = power.restore({"enabled": False}, snapshot_dir)
 
     assert result["status"] == "skipped"
+    assert "no power plan in snapshot" in result["reason"]
+    assert fake_subprocess.run_calls == []
+
+
+def test_restore_not_enabled_reason_names_unelevated_export(
+        monkeypatch, snapshot_dir, fake_subprocess):
+    _install_admin(monkeypatch, True)
+    _install_subprocess(monkeypatch, fake_subprocess)
+
+    result = power.restore({"enabled": False, "skip_reason": "not_admin"},
+                           snapshot_dir)
+
+    assert result["status"] == "skipped"
+    assert "administrator" in result["reason"].lower()
     assert fake_subprocess.run_calls == []
 
 

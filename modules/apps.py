@@ -504,10 +504,17 @@ def restore(data: dict, snapshot_dir: Path) -> dict:
               or "no package found" in stdout_lower):
             rpt.add_skipped(pkg_id, "unavailable")
         else:
-            stderr_tail = (result.stderr or "").strip()[-500:]
+            # winget writes its human-readable error to stdout, not stderr,
+            # so both streams go into the detail; the code is also rendered
+            # as hex because winget exit codes are HRESULT-shaped.
+            output_tail = "\n".join(
+                s for s in ((result.stdout or "").strip(),
+                            (result.stderr or "").strip()) if s
+            )[-500:]
             rpt.add_failed(
                 pkg_id,
-                f"returncode={result.returncode}; {stderr_tail}"
+                f"returncode={result.returncode} "
+                f"(0x{result.returncode & 0xFFFFFFFF:08X}); {output_tail}"
             )
 
     manual = data.get("manual", [])

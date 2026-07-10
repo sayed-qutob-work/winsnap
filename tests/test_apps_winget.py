@@ -81,9 +81,15 @@ def _is_install_for(pkg_id):
         (WINGET_NO_PACKAGE_FOUND, "", "skipped", "unavailable"),
         (1, "No package found matching input criteria.", "skipped", "unavailable"),
         (1, "some other winget failure", "failed", "returncode=1"),
+        # winget writes its real error explanation to stdout, not stderr --
+        # the failure detail must carry it (0x8A15003B == 2316632123).
+        (2316632123, "0x8a15003b : Rest API internal error", "failed",
+         "Rest API internal error"),
+        (2316632123, "", "failed", "(0x8A15003B)"),
     ],
     ids=["installed", "already-installed-code", "already-installed-stdout",
-         "unavailable-code", "unavailable-stdout", "other-failure"],
+         "unavailable-code", "unavailable-stdout", "other-failure",
+         "failure-stdout-captured", "failure-hex-code"],
 )
 def test_restore_classifies_each_outcome(monkeypatch, snapshot_dir,
                                           returncode, stdout, expected_status,

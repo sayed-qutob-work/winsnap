@@ -1,0 +1,73 @@
+PS C:\Users\WDAGUtilityAccount\Desktop\winsnap> python restore.py .\sandbox-tools\winsnap_20260710_150337.winsnap
+=======================================================
+  WinSnap — Windows Settings Restorer
+=======================================================
+
+Extracting snapshot to: C:\Users\WDAGUtilityAccount\AppData\Local\Temp\winsnap_restore__3ylfdp2
+
+Snapshot from: 2026-07-10T15:04:10.936935
+WinSnap version: 0.3.0
+Snapshot format: 0.3.0
+
+
+[env_vars] Restoring...
+[env_vars] Open a new terminal/shell to see the changes.
+
+[region_lang] Restoring...
+[region_lang] Note: keyboard layouts only load if the matching language pack is installed on this PC.
+[region_lang] restore: matched (42 item(s)).
+
+[apps] Restoring...
+[apps] winget not found on target; skipping installs.
+
+[wallpaper] Restoring...
+[wallpaper] Applied: C:\Users\WDAGUtilityAccount\Pictures\WinSnap\wallpaper.jpg
+
+[mouse_display] Restoring...
+[mouse_display] Mouse and keyboard settings restored.
+
+[cursors] Restoring...
+[cursors] Cursor scheme restored.
+
+[sound_scheme] Restoring...
+[sound_scheme] Restored scheme '.Default'.
+
+[power] Restoring...
+
+[fonts] Restoring...
+[fonts] restore: matched (1 item(s)).
+
+[explorer] Restoring...
+[explorer] restore: matched (7 item(s)).
+
+[desktop_icons] Restoring...
+[desktop_icons] restore: matched (5 item(s)).
+
+[startup] Restoring...
+[startup] restore: matched (10 item(s)).
+
+[taskbar] Restoring...
+[taskbar] Skipped 1 non-essential file(s): ['desktop.ini']
+[taskbar] Restored 14 pinned shortcut(s) to C:\Users\WDAGUtilityAccount\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar
+[winutil] Restarting Explorer to apply changes...
+[winutil] Explorer restarted.
+
+=======================================================
+  Restore summary
+=======================================================
+  [env_vars] restore=matched (23 item(s))
+  [region_lang] restore=matched (42 item(s))
+  [apps] restore=skipped (0 item(s))
+  [wallpaper] restore=matched (4 item(s))
+  [mouse_display] restore=matched (7 item(s))
+  [cursors] restore=matched (15 item(s))
+  [sound_scheme] restore=matched (51 item(s))
+  [power] restore=skipped (0 item(s))
+  [fonts] restore=matched (1 item(s))
+  [explorer] restore=matched (7 item(s))
+  [desktop_icons] restore=matched (5 item(s))
+  [startup] restore=matched (10 item(s))
+  [taskbar] restore=matched (22 item(s))
+=======================================================
+
+Note: Some changes (theme, env vars) may require a logout/restart to fully apply.
