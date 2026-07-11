@@ -158,7 +158,7 @@ winsnap_<timestamp>/
 refuses snapshots whose MAJOR version is newer than it understands, so
 old restorers fail loudly instead of silently mis-applying new fields.
 
-Current format version: **0.2.0**.
+Current format version: **0.3.0**.
 
 ---
 

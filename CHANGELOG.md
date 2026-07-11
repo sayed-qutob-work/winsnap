@@ -9,7 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+Snapshot format bumped to **0.3.0** (older 0.2.0 snapshots still restore).
+
+### Added
+
+- **PyQt6 desktop app** (`gui.py`) — Export and Restore tabs backed by the same
+  module selector and backend functions the CLI uses, so behavior is identical
+  either way. Includes a live results view that groups each module's outcome as
+  Matched / Partial / Failed / Skipped, and a collision check before export.
+- **Verify after restore** — each module now exposes `verify(snapshot,
+  snapshot_dir) -> report`, which re-checks applied settings against the
+  snapshot and reports drift without re-running restore. Surfaced in the GUI as
+  a "Verify after restore" option.
+- **Richer captures (format 0.3.0)** — taskband blob + pins list, accent
+  colour palette fields, wallpaper style/tile/sha256/image-format, bundled
+  cursor and sound-scheme files, mouse-acceleration thresholds, and an
+  `env_vars` `source_profile`/`vars` wrapper.
+
+### Changed
+
+- Module contract is now `export -> dict`, `restore -> report`, `verify ->
+  report`; both CLI and GUI classify outcomes from the report's `status` field
+  rather than from raised exceptions.
+- Module order and the export/restore module *set* are now derived from a
+  single `MODULE_NAMES` list in `modules/manifest.py`.
+- Restore reporting reworked with a per-run results summary and clearer
+  per-item detail.
+
+### Fixed
+
+- Backend round-trip hardening: multiple export→restore→verify fidelity fixes
+  (wallpaper multi-monitor handling, mouse acceleration, cursor/sound file
+  bundling, winget schema, env-var PATH rewrite) with regression tests.
 
 ---
 
@@ -67,5 +98,5 @@ The following modules existed before this release and continue to work:
 
 ---
 
-[Unreleased]: https://github.com/<your-username>/winsnap/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/<your-username>/winsnap/releases/tag/v0.1.0
+[Unreleased]: https://github.com/sayed-qutob-work/winsnap/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sayed-qutob-work/winsnap/releases/tag/v0.1.0

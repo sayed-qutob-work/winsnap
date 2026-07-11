@@ -13,8 +13,14 @@ library** at runtime. There's no `requirements.txt` for runtime; everything
 WinSnap needs ships with Python.
 
 ```bash
-git clone https://github.com/<your-username>/winsnap.git
+git clone https://github.com/sayed-qutob-work/winsnap.git
 cd winsnap
+
+# Dev/test dependencies (pytest + hypothesis)
+pip install -r requirements-dev.txt
+
+# Optional: the PyQt6 desktop app
+pip install PyQt6
 
 # Optional: build the standalone .exe
 pip install pyinstaller
@@ -26,6 +32,7 @@ To run from source:
 ```bash
 python export.py
 python restore.py snapshot.winsnap
+python gui.py            # PyQt6 desktop app (Export/Restore tabs)
 ```
 
 ---
@@ -33,12 +40,17 @@ python restore.py snapshot.winsnap
 ## Running tests
 
 ```bash
-python tests/smoke_apps.py
+python -m pytest tests/ -q
 ```
 
-The test suite is minimal today — mostly unit tests for the apps filter and
-normalization logic. Pull requests adding more coverage are welcome, especially
-for new modules.
+The suite is mock-heavy — it never touches the real registry — and mixes plain
+`pytest` cases with `hypothesis` property-based tests. GUI-related tests need
+`PyQt6` installed and run headlessly via `QT_QPA_PLATFORM=offscreen`.
+
+CI additionally runs the standalone apps-filter smoke test (`python
+tests/smoke_apps.py`), which exercises the filtering/normalization logic without
+the interactive checklist. Pull requests adding more coverage are welcome,
+especially for new modules.
 
 ---
 
@@ -50,13 +62,17 @@ Every settings category is a self-contained module under `modules/` exposing:
 
 ```python
 def export(snapshot_dir: Path) -> dict
-def restore(snapshot: dict, snapshot_dir: Path) -> None
+def restore(snapshot: dict, snapshot_dir: Path) -> dict   # report: status/reason/items
+def verify(snapshot: dict, snapshot_dir: Path) -> dict     # same report shape
 ```
 
-That's the entire contract. The dict returned by `export()` is JSON-serialized
-into `snapshot.json` inside the `.winsnap` zip. `restore()` receives that same
-dict back along with the snapshot directory (in case the module bundled
-auxiliary files like fonts or shortcuts).
+The dict returned by `export()` is JSON-serialized into `snapshot.json` inside
+the `.winsnap` zip. `restore()` and `verify()` receive that same dict back along
+with the snapshot directory (in case the module bundled auxiliary files like
+fonts or shortcuts) and each return a **report** dict — `status` is one of
+`matched`, `partial`, `failed`, or `skipped` (see `modules/report.py`). Both the
+CLI and the GUI classify outcomes from this `status` field, never from whether
+the call happened to raise.
 
 ### Stdlib only
 
@@ -97,10 +113,13 @@ Avoid stack traces in normal output — let the parent script catch and report.
 
 ## Adding a new settings category
 
-1. Create `modules/your_category.py` matching the export/restore contract.
-2. Add it to the modules list in `export.py` (`_build_modules`) and
-   `restore.py` (`ALL_MODULES`). Order in `restore.py` matters — slot it in
-   so it doesn't run after Explorer is restarted unless that's intentional.
+1. Create `modules/your_category.py` matching the export/restore/verify
+   contract.
+2. Add its name to `MODULE_NAMES` in `modules/manifest.py` — the single source
+   of truth for the module *set* and restore *order*. `export.py` and
+   `restore.py` both derive their lists from it, so you edit exactly one place.
+   Order matters: slot it in so it doesn't run after Explorer is restarted
+   (the `taskbar`/Explorer-managed modules run last) unless that's intentional.
 3. Add a `_summarize` clause to `restore.py` so `--dry-run` produces a
    useful one-liner.
 4. Bump `SNAPSHOT_FORMAT_VERSION` in `export.py`:
@@ -114,7 +133,7 @@ Avoid stack traces in normal output — let the parent script catch and report.
 
 ## Pull request checklist
 
-- [ ] `python tests/smoke_apps.py` passes (and any new tests you added)
+- [ ] `python -m pytest tests/ -q` passes (and any new tests you added)
 - [ ] `python -m py_compile <changed files>` produces no errors
 - [ ] You ran a manual round-trip of the affected module on your own PC
 - [ ] README and CHANGELOG updated if behavior changed

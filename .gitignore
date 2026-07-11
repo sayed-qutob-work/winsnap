@@ -31,4 +31,7 @@ Thumbs.db
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
+# Local Windows Sandbox test harness (machine-specific paths)
 sandbox-tools
+Winsnap.wsb
+results

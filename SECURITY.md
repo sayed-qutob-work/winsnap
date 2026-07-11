@@ -73,7 +73,7 @@ Future hardening on the roadmap:
 
 - Reports about the **SmartScreen** warning when running the unsigned `.exe`
   — that's expected behavior for any unsigned Windows binary.
-- General complaints about `winget` itself or third-party MCP servers.
+- General complaints about `winget` itself or the packages it installs.
 - Privacy reports about Windows-side telemetry — WinSnap does not collect
   or transmit any data beyond `winget`'s own behavior.
 
